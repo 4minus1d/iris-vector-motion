@@ -8,12 +8,13 @@ Both are 1080 × 1920, 15.00 s, 60 fps, and loop **pixel-exactly**.
 
 | | |
 |---|---|
-| **`iris.html`** | An eye opens; the camera falls through the pupil into a corridor of screens. Each arrives from the far distance as a circle and morphs into a 9:16 rounded rectangle as it reaches you — carrying the film's own aspect ratio, so screen and frame coincide at the moment you pass through. Every pass turns the image over. It accelerates. The last screen morphs into the pupil, and the lids close around it. |
+| **`iris.html`**<br>*Eyes All the Way Down* | An eye opens, and you fall through the pupil. Beyond it is a corridor of screens — each arriving out of the far dark as a circle and becoming a screen as it reaches you, every opening carrying the frame's own shape so that for one instant the screen and the film are the same object. Going through turns the world inside out. It gets faster. At the end of the tunnel there is always one more eye, and it never gets closer — until you arrive, and it is a pupil, and the lids close around it. |
 | **`iris-swipe.html`** | The same eye, the same fall. Beyond it, a deck of tiles and a thumb throwing them upward, faster and faster — 26 throws from 0.45 s apart down to 0.18 s. Each tile carries a small picture of an eye. The last one is not thrown: it morphs into the pupil instead. |
 | **`index.html`** | The original test the system grew out of — a circle morphing to a rounded square. |
 
-*You swipe past every image of the thing, and the thing is watching. The loop is
-the scroll.*
+*We keep building brighter screens, and every one of them is shaped like the eye
+that made it. You swipe past every image of the thing, and the thing is
+watching. The loop is the scroll.*
 
 ## Run
 
@@ -23,10 +24,21 @@ node server.mjs
 
 Then open `http://localhost:5173/iris.html` or `/iris-swipe.html`.
 
-Space toggles playback, the scrubber seeks, and **Save video** records one full
-loop as MP4 (H.264 where supported, WebM otherwise). Recording is a real-time
-canvas capture, so a 15 s film takes 15 s — and the tab must stay visible, or
-the browser stops painting and the capture receives nothing.
+Space toggles playback and the scrubber seeks. **Save video** renders the loop
+offline through WebCodecs and writes the MP4 by hand — every frame is drawn and
+encoded with an exact timestamp, so the file is constant-frame-rate by
+construction. About 12 s for a 15 s film.
+
+The **speed** control applies to the saved file as well as to playback. Because
+`render(t)` is a pure function of continuous time, a slower speed does not
+repeat frames — it samples the animation at a finer step and computes genuinely
+new in-between frames. Real slow motion, not a post-process. Every option
+divides evenly into whole frames, so the loop stays seamless:
+
+| | 0.25× | 0.5× | 0.75× | 1× | 1.5× | 2× | 3× |
+|---|---|---|---|---|---|---|---|
+| frames | 3600 | 1800 | 1200 | 900 | 600 | 450 | 300 |
+| length | 60 s | 30 s | 20 s | 15 s | 10 s | 7.5 s | 5 s |
 
 ## Documentation
 

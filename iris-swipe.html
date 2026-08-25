@@ -27,6 +27,10 @@
   button:hover:not(:disabled) { background: var(--ink); color: #000; border-color: var(--ink); }
   button:disabled { opacity: .35; cursor: default; }
   input[type=range] { flex: 1 1 200px; accent-color: #fff; height: 2px; background: var(--line); cursor: pointer; }
+  select {
+    font: inherit; color: var(--ink); background: #0e0e0e;
+    border: 1px solid var(--line); padding: 7px 8px; cursor: pointer;
+  }
   .status { color: var(--dim); width: 100%; text-align: center; }
   .status.on { color: var(--ink); }
 </style>
@@ -39,6 +43,15 @@
   <button id="toggle">Pause</button>
   <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
   <span id="clockLabel">0.0s</span>
+  <select id="speed" title="Playback speed - also applies to the saved file">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="0.75">0.75x</option>
+    <option value="1" selected>1x</option>
+    <option value="1.5">1.5x</option>
+    <option value="2">2x</option>
+    <option value="3">3x</option>
+  </select>
   <button id="save">Save video</button>
   <span class="status" id="status"></span>
 </div>
@@ -431,10 +444,17 @@ function drawDeck(time, cam) {
 
 /* ---------------- clock ---------------- */
 let playing = true, clock = 0, last = performance.now(), recording = false;
+/* Playback rate. Because render(t) is a pure function of continuous time, a
+   slower speed does not repeat frames - it samples the animation at a finer
+   step and computes genuinely new in-between frames. Real slow motion, not a
+   post-process. Values are chosen so DURATION*fps/speed stays a whole number
+   of frames, which is what keeps the exported loop seamless. */
+let speed = 1;
 const statusEl = document.getElementById("status");
 const saveBtn  = document.getElementById("save");
 const toggleBtn= document.getElementById("toggle");
 const scrub    = document.getElementById("scrub");
+const speedSel = document.getElementById("speed");
 const clockLbl = document.getElementById("clockLabel");
 
 function setStatus(text, on) { statusEl.textContent = text; statusEl.classList.toggle("on", !!on); }
@@ -450,7 +470,7 @@ function tick(now) {
   if (recording) return;
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
-  if (playing) clock = (clock + dt) % DURATION;
+  if (playing) clock = (clock + dt * speed) % DURATION;
   render(clock);
   updateUI();
 }
@@ -552,6 +572,7 @@ async function startRecording() {
      Wall time only decides WHEN to emit, so playback speed stays correct on a
      60, 120 or 144Hz display. At most one frame per tick, so a late frame is
      never compensated by bunching two into the same instant. */
+  const outFrames = Math.round(DURATION * CONFIG.fps / speed);
   let frame = 0, t0 = 0, lastStatus = 0;
   const pump = now => {
     if (!recording) return;
@@ -559,7 +580,7 @@ async function startRecording() {
     if (!t0) t0 = now;
     if (Math.floor((now - t0) / FRAME_MS) < frame) return;
 
-    clock = frame / CONFIG.fps;
+    clock = frame * speed / CONFIG.fps;
     render(clock);
     track.requestFrame();
     frame++;
@@ -567,9 +588,9 @@ async function startRecording() {
     if (now - lastStatus > 200) {                   // DOM writes are not free: a
       lastStatus = now;                             // per-frame textContent write
       updateUI();                                   // competes with the encoder
-      setStatus("recording... " + Math.round(frame / TOTAL_FRAMES * 100) + "%", true);
+      setStatus("recording... " + Math.round(frame / outFrames * 100) + "%", true);
     }
-    if (frame >= TOTAL_FRAMES) stopRecording();
+    if (frame >= outFrames) stopRecording();
   };
   pumpId = requestAnimationFrame(pump);
 }
@@ -679,6 +700,7 @@ async function exportFilm() {
 
   exporting = true;
   saveBtn.disabled = true;
+  speedSel.disabled = true;
   const wasPlaying2 = playing;
   playing = false;
 
@@ -700,9 +722,10 @@ async function exportFilm() {
   });
   enc.configure(cfg);
 
+  const outFrames = Math.round(DURATION * CONFIG.fps / speed);
   const us = 1e6 / CONFIG.fps;
-  for (let n = 0; n < TOTAL_FRAMES && !failed; n++) {
-    clock = n / CONFIG.fps;
+  for (let n = 0; n < outFrames && !failed; n++) {
+    clock = n * speed / CONFIG.fps;
     render(clock);
     const frame = new VideoFrame(canvas, {
       timestamp: Math.round(n * us), duration: Math.round(us)
@@ -711,7 +734,7 @@ async function exportFilm() {
     frame.close();
     while (enc.encodeQueueSize > 6 && !failed) await yieldNow();   // backpressure
     if (n % 15 === 0) {
-      setStatus("rendering " + Math.round((n + 1) / TOTAL_FRAMES * 100) + "%", true);
+      setStatus("rendering " + Math.round((n + 1) / outFrames * 100) + "%", true);
       await yieldNow();
     }
   }
@@ -719,13 +742,13 @@ async function exportFilm() {
   try { await enc.flush(); } catch (err) { failed = failed || err.message; }
   try { enc.close(); } catch (err) { /* already closed on error */ }
 
-  const restore = () => { exporting = false; saveBtn.disabled = false;
+  const restore = () => { exporting = false; saveBtn.disabled = false; speedSel.disabled = false;
                           last = performance.now(); playing = wasPlaying2;
                           toggleBtn.textContent = playing ? "Pause" : "Play"; };
 
   // Refuse to write a file we cannot vouch for; fall back rather than ship a
   // subtly broken one.
-  if (failed || !avcc || !ordered || samples.length !== TOTAL_FRAMES) {
+  if (failed || !avcc || !ordered || samples.length !== outFrames) {
     setStatus(failed ? "encoder error: " + failed
               : !ordered ? "encoder reordered frames — using capture"
               : "encode incomplete — using capture", true);
@@ -738,10 +761,11 @@ async function exportFilm() {
   const blob = new Blob([muxMP4(samples, syncs, avcc, W, H, CONFIG.fps)], { type: "video/mp4" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = "iris-swipe-1080x1920.mp4";
+  a.href = url;
+  a.download = "iris-swipe-1080x1920" + (speed === 1 ? "" : "-" + speed + "x") + ".mp4";
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
-  setStatus("saved .mp4  " + TOTAL_FRAMES + " frames  " + DURATION.toFixed(1) + "s  "
+  setStatus("saved .mp4  " + outFrames + " frames  " + (DURATION / speed).toFixed(1) + "s  "
             + (blob.size / 1048576).toFixed(1) + " MB", true);
   restore();
 }
@@ -760,6 +784,8 @@ toggleBtn.addEventListener("click", () => {
   playing = !playing;
   toggleBtn.textContent = playing ? "Pause" : "Play";
 });
+speedSel.addEventListener("change", () => { speed = Number(speedSel.value) || 1; });
+
 scrub.addEventListener("input", () => {
   if (recording) return;
   clock = (Number(scrub.value) / 1000) * DURATION;

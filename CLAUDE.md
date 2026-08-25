@@ -10,7 +10,7 @@ generator, one camera rig, one canvas, one exporter, all hand-written.
 
 | File | |
 |---|---|
-| `iris.html` | Eye → dive → corridor of screens → eye |
+| `iris.html` — *Eyes All the Way Down* | Eye → dive → corridor of screens → eye |
 | `iris-swipe.html` | Eye → dive → deck of tiles thrown upward by a thumb → eye |
 | `index.html` | The original circle → rounded-square morph test |
 | `server.mjs` | Zero-dependency static server, local dev only |
@@ -194,6 +194,13 @@ Verify a change here by loading the blob into a `<video>` and confirming
 `duration` and `videoWidth`/`videoHeight`; that proves the container parses.
 Both films currently produce 900 frames, ~14.2 MB, `duration 15.000`,
 1080 × 1920, in about 12 s.
+
+**Speed applies to the export.** Frame `n` samples `clock = n * speed / fps` and
+the output is `DURATION * fps / speed` frames, so a slower speed computes new
+in-between frames rather than repeating them. Every offered speed must divide
+`DURATION * fps` (900) into a whole number of frames — otherwise the last frame
+does not tile `[0, DURATION)` and the loop seam drifts. Verified at 2×:
+450 frames, decoded `duration 7.5`.
 
 ---
 
