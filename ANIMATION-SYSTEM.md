@@ -519,112 +519,111 @@ suspicious result before acting on it.
 
 ## 9. Export
 
-`canvas.captureStream` → `MediaRecorder`, no libraries.
+**Do not capture. Render.**
 
-```js
-MIMES = ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1.42E01E",
-         "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8",
-         "video/webm"]
-videoBitsPerSecond: 24_000_000
-```
+This section is the one that took the longest to get right, and the conclusion
+is blunt: `canvas.captureStream` + `MediaRecorder` cannot be made reliably
+smooth for this material, and no amount of clock discipline on the authoring
+side fixes it.
 
-Prefer MP4/H.264 where supported (Chrome does), fall back through VP9/VP8 WebM.
+### 9.1 Why real-time capture fails here
 
-### 9.1 Never drive the recording clock from elapsed time
+`captureStream` + `MediaRecorder` is a **real-time pipeline with a deadline**.
+At 1080×1920×60 the encoder must keep pace with the display — roughly 124
+megapixels per second. When it cannot, frames are dropped or arrive late, and
+because MediaRecorder timestamps frames *by arrival*, that timing is written
+into the file permanently.
 
-This is the single most important rule in this section, and it was learned from
-a real defect: **stutter in the first second of every saved file.**
+Two rounds of fixes were attempted on the capture path before abandoning it.
+Both were real improvements and both were insufficient:
 
-The naive capture loop advances the animation by measured wall-clock delta:
-
-```js
-const dt = (now - last) / 1000;      // ✗ WRONG while recording
-recClock += dt;
-```
-
-That is correct for *playback* and wrong for *capture*. Encoder construction,
-GPU buffer allocation and the first keyframe are expensive, so the opening
-frames of a take run long. With a wall-clock delta, a frame that took 45 ms
-advances the animation by 45 ms — so the motion **leaps forward** during
-warm-up and then settles back to normal speed once the encoder catches up.
-
-The frames are not dropped. The judder is baked into the motion.
-
-Simulated against a realistic tick sequence — eight frames stalling at 45 ms,
-then clean 60 Hz:
+**Round one — the clock.** The capture loop advanced animation time by measured
+wall-clock delta, which is correct for playback and wrong for capture. Encoder
+warm-up made the opening frames run long, so the animation *leapt forward* by
+however long each stall lasted. Simulated against eight frames stalling at
+45 ms, then clean 60 Hz:
 
 | | first eight animation steps | jitter |
 |---|---|---|
 | wall-clock `dt` | `45.0, 45.0, 45.0, 45.0, 45.0, 45.0, 45.0, 16.7` ms | **28.33 ms** |
 | fixed timestep | `16.7 × 8` ms | **0.00 ms** |
 
-**The rule: while capturing, animation time is a fixed timestep.**
+**Round two — the pipeline.** Manual frame capture (`captureStream(0)` plus an
+explicit `track.requestFrame()` per rendered frame), a primed encoder, and UI
+writes throttled off the per-frame path.
+
+Both landed. It still stuttered — because the deadline was never the author's
+to meet.
+
+> **Guidance.** When a fix improves a symptom without removing it, check whether
+> you are treating a constraint as a bug. The constraint here was *real-time*.
+> The answer was to delete it, not to optimise inside it.
+
+### 9.2 The method: offline WebCodecs + a hand-written MP4
 
 ```js
-clock = frame / CONFIG.fps;     // frame n is ALWAYS exactly n/fps
+render(clock);                                   // frame n at exactly n/fps
+const frame = new VideoFrame(canvas, {
+  timestamp: Math.round(n * 1e6 / fps),
+  duration:  Math.round(1e6 / fps)
+});
+encoder.encode(frame, { keyFrame: n % fps === 0 });
+frame.close();
 ```
 
-Wall time then decides only *when* to emit, which keeps playback speed correct
-across refresh rates:
+There is no deadline. The machine takes as long as it takes, every frame is
+encoded, and each carries an exact timestamp. The samples are then muxed into an
+MP4 by hand — `ftyp` / `moov` / `mdat`, one H.264 track, all samples in a single
+chunk.
 
-```js
-if (Math.floor((now - t0) / FRAME_MS) < frame) return;   // not due yet
-```
+Properties this buys, none of which capture can offer:
 
-Emit **at most one frame per tick**. Never catch up by bunching several frames
-into the same instant — MediaRecorder timestamps by arrival, so bunching
-produces exactly the artifact you are trying to avoid. Verified: 900 frames from
-a clean 60 Hz sequence, and 50 % of ticks consumed on a 120 Hz display (correct
-60 fps rather than double speed).
+- **Constant frame rate by construction.** Every sample has an identical 1000-unit
+  duration in a 60000 timescale. Jitter is not unlikely; it is *unrepresentable*.
+- **No dropped frames, ever.** 900 frames in, 900 samples out, asserted before
+  writing the file.
+- **No `requestAnimationFrame`,** so it runs in a background tab — the failure
+  mode that used to stall recording at 0 % simply does not apply.
+- **Faster than real time** where the machine allows: ~12 s for a 15 s film.
 
-### 9.2 Capture frames manually
+Measured on both films: 900 frames, 14.2 MB, and the browser decodes the result
+at `duration 15.000`, `1080 × 1920`.
 
-```js
-const stream = canvas.captureStream(0);          // 0 = capture only on request
-const track  = stream.getVideoTracks()[0];
-// … per frame:
-render(clock);
-track.requestFrame();
-```
+### 9.3 Muxer notes
 
-`frameRate: 0` means nothing is captured until asked. One `requestFrame` per
-rendered frame: no duplicates from an incidental repaint, no drops from a missed
-one. Feature-detect `track.requestFrame` and fall back to `captureStream(fps)`.
+- `avcC` comes from `metadata.decoderConfig.description` on the first chunk,
+  which requires configuring with `avc: { format: "avc" }` (length-prefixed
+  NALs, 51 bytes here). Embed it verbatim.
+- `stco` holds an absolute file offset that depends on `moov`'s own size, which
+  is circular. Build `moov` once to measure, then again with the real offset —
+  the length cannot change, only a value inside a fixed-width `u32`.
+- Layout `ftyp` → `moov` → `mdat` (faststart). All sizes are known before
+  writing, so there is no reason to put `moov` last.
+- **Check for frame reordering.** B-frames would make decode order differ from
+  presentation order and require a `ctts` table. Chrome's H.264 encoder does not
+  reorder here — verified by asserting chunk timestamps are monotonic — but the
+  code checks at runtime and refuses to write rather than emitting a subtly
+  broken file.
 
-### 9.3 Prime the encoder
+### 9.4 Refuse to ship what you cannot vouch for
 
-Build a throwaway `MediaRecorder` on the same stream, push ~10 frames through
-it, stop it and discard the blob. This pays for codec setup, GPU allocation and
-the first keyframe *before* the real take starts. Guard it with a timeout so a
-quirky implementation cannot hang the button.
+The export aborts to the capture fallback, with a message saying why, if any of
+these fail: the encoder errored, no `avcC` description arrived, timestamps came
+back out of order, or the sample count does not equal the frame count. A wrong
+file that plays is worse than a clear failure.
 
-### 9.4 Do not write to the DOM every frame
+### 9.5 The fallback
 
-The original loop set `scrub.value`, `clockLbl.textContent` and a status string
-on every tick — three style invalidations per frame, competing with the encoder
-exactly when it is busiest. Throttle UI updates to ~5/second during capture.
-
-### 9.5 It is still a real-time capture
-
-Recording a 15 s film takes 15 s. Measured accuracy on the previous
-implementation: 15066 ms against a 15.00 s target.
-
-**A hidden tab stops painting.** `requestAnimationFrame` halts, the capture
-stream receives nothing, and the recording sits at 0 % forever. There is no way
-around this for canvas capture; detect and say so:
+`MediaRecorder` is kept for browsers without WebCodecs, with its guards intact:
+MIME preference (MP4/H.264 → VP9 → VP8), the fixed-timestep clock, manual
+`requestFrame`, encoder priming, throttled UI, and the hidden-tab check —
 
 ```js
 if (document.hidden) { setStatus("keep this tab visible to record"); return; }
-// plus a visibilitychange handler that abandons an in-flight take
 ```
 
-*Learned by hitting it.* A recording silently stalled at 0 % with
-`document.hidden === true`. Failing loudly beats failing silently.
-
-**A frame-exact offline render would need its own encoder** — WebCodecs
-`VideoEncoder` plus a hand-written muxer. That removes the real-time constraint
-entirely and is the correct answer if capture quality ever stops being good
-enough. MediaRecorder alone is real-time only.
+A hidden tab stops painting, `requestAnimationFrame` halts, and a capture would
+sit at 0 % forever. Failing loudly beats failing silently.
 
 ---
 
@@ -804,11 +803,22 @@ A frame that looked wrong was a stale read taken during a pane resize. Measure
 before you "fix."
 
 ### 12.14 A capture clock driven by elapsed time
-Every saved file stuttered in its first second. The encoder's warm-up cost made
-the opening frames run long, and because the animation advanced by measured
-`dt`, the motion leapt forward by however long each stall lasted — 45 ms steps
-instead of 16.7 ms, a 28 ms jitter, baked into the file. Playback wants elapsed
-time; capture wants a fixed timestep. → [§9.1](#91-never-drive-the-recording-clock-from-elapsed-time)
+Saved files stuttered. The encoder's warm-up made the opening frames run long,
+and because the animation advanced by measured `dt`, the motion leapt forward by
+however long each stall lasted — 45 ms steps instead of 16.7 ms, a 28 ms jitter,
+baked into the file. Playback wants elapsed time; capture wants a fixed
+timestep. → [§9.1](#91-why-real-time-capture-fails-here)
+
+### 12.15 Optimising inside a constraint instead of removing it
+The clock fix helped and the file still stuttered. So did manual frame capture,
+a primed encoder, and throttled UI writes. All three were real improvements to
+a pipeline that was **structurally unable** to do the job: real-time capture at
+1080×1920×60 has a deadline the author cannot meet on the encoder's behalf.
+Rendering offline through WebCodecs and muxing by hand removed the deadline and
+the symptom together.
+
+> When a fix improves a symptom without removing it, check whether you are
+> treating a constraint as a bug. → [§9](#9-export)
 
 ---
 

@@ -164,26 +164,36 @@ taken during a pane resize. Verify a suspicious result before "fixing" it.
 
 ---
 
-## Export
+## Export — render, do not capture
 
-`canvas.captureStream(0)` + explicit `track.requestFrame()` → `MediaRecorder`,
-MP4/H.264 preferred, WebM fallback.
+Saving runs **offline through WebCodecs** and writes the MP4 by hand
+(`ftyp`/`moov`/`mdat`, one H.264 track). Every frame is rendered, handed to a
+`VideoEncoder` with an exact timestamp, and muxed. **Do not replace this with
+`MediaRecorder`.**
 
-**While capturing, animation time is a fixed timestep** — `clock = frame / fps`,
-never elapsed wall-clock delta. Wall time only decides *when* to emit, and at
-most one frame per tick. This is not a preference: driving the capture clock
-from `dt` bakes encoder warm-up directly into the motion (45 ms steps instead of
-16.7 ms — the stutter that used to appear in the first second of every file).
-Playback uses elapsed time; capture must not. See ANIMATION-SYSTEM.md §9.1.
+`canvas.captureStream` + `MediaRecorder` is a real-time pipeline with a
+deadline. At 1080×1920×60 the encoder cannot reliably keep pace, dropped and
+late frames get timestamped by arrival, and the timing is baked into the file.
+That path was fixed twice — fixed-timestep clock, manual `requestFrame`, primed
+encoder, throttled UI — and **it still stuttered**, because the deadline was
+never the author's to meet. It is kept only as a fallback for browsers without
+WebCodecs.
 
-Also load-bearing, do not remove: the encoder is **primed** with a throwaway
-recorder before the real take, and UI/DOM writes are **throttled** to ~5/s
-during capture rather than running every frame.
+What the offline path guarantees, and what to preserve if you touch it:
 
-**It is still a real-time capture** — a 15 s film takes 15 s, and **the tab must
-stay visible**. A hidden tab stops painting and the recording stalls at 0 %
-forever. The Save button guards against this; keep that guard. A frame-exact
-offline render would require WebCodecs plus a hand-written muxer.
+- Constant frame rate **by construction** — identical sample durations in a
+  fixed timescale, so jitter is unrepresentable rather than merely unlikely.
+- 900 frames in, 900 samples out — asserted before a file is written.
+- No `requestAnimationFrame`, so it works in a background tab.
+- It **refuses to write** and falls back if the encoder errored, no `avcC`
+  arrived, timestamps came back out of order (B-frames would need a `ctts`
+  table), or the sample count is wrong. A wrong file that plays is worse than a
+  clear failure — keep those checks.
+
+Verify a change here by loading the blob into a `<video>` and confirming
+`duration` and `videoWidth`/`videoHeight`; that proves the container parses.
+Both films currently produce 900 frames, ~14.2 MB, `duration 15.000`,
+1080 × 1920, in about 12 s.
 
 ---
 

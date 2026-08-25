@@ -546,7 +546,171 @@ function stopRecording() {
   if (recorder && recorder.state !== "inactive") recorder.stop();
 }
 
-saveBtn.addEventListener("click", () => { if (!recording) startRecording(); });
+/* ---------------- offline export ----------------
+   The real fix for stutter: stop capturing and start rendering.
+
+   canvas.captureStream + MediaRecorder is a REAL-TIME pipeline. At
+   1080x1920x60 the encoder has to keep pace with the display, and when it
+   cannot, frames are dropped or arrive late - and MediaRecorder timestamps by
+   arrival, so that timing is baked into the file. No amount of clock
+   discipline on our side fixes an encoder that is behind.
+
+   Here every frame is rendered, handed to a VideoEncoder with an exact
+   timestamp, and the encoded samples are muxed into an MP4 by hand. There is
+   no deadline: the machine takes as long as it takes, and all 900 frames land
+   on exact 1/60s boundaries. It also needs no requestAnimationFrame, so it
+   works in a background tab.                                                */
+
+const MP4 = {
+  u8:  a => new Uint8Array(a),
+  u16: n => new Uint8Array([n >> 8 & 255, n & 255]),
+  u32: n => new Uint8Array([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]),
+  str: s => { const o = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) o[i] = s.charCodeAt(i); return o; },
+  cat: a => { let n = 0; for (const x of a) n += x.length; const o = new Uint8Array(n); let p = 0;
+              for (const x of a) { o.set(x, p); p += x.length; } return o; }
+};
+const box  = (type, ...parts) => { const b = MP4.cat(parts);
+  return MP4.cat([MP4.u32(b.length + 8), MP4.str(type), b]); };
+const fbox = (type, ver, flags, ...parts) =>
+  box(type, MP4.u8([ver, flags >> 16 & 255, flags >> 8 & 255, flags & 255]), ...parts);
+const MATRIX = MP4.cat([0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000].map(MP4.u32));
+
+// ISO base media, one H.264 track, all samples in a single chunk.
+function muxMP4(samples, syncs, avcc, w, h, fps) {
+  const { u8, u16, u32, str, cat } = MP4;
+  const N = samples.length, TS = fps * 1000, DELTA = 1000, MTS = 1000;
+  const movieDur = Math.round(N / fps * MTS), mediaDur = N * DELTA;
+
+  const stsd = fbox("stsd", 0, 0, u32(1),
+    box("avc1", u8(new Array(6).fill(0)), u16(1),
+      u16(0), u16(0), u32(0), u32(0), u32(0),
+      u16(w), u16(h), u32(0x00480000), u32(0x00480000), u32(0), u16(1),
+      u8(new Array(32).fill(0)), u16(0x0018), u8([0xff, 0xff]),
+      box("avcC", avcc)));
+  const stts = fbox("stts", 0, 0, u32(1), u32(N), u32(DELTA));
+  const stss = fbox("stss", 0, 0, u32(syncs.length), ...syncs.map(u32));
+  const stsc = fbox("stsc", 0, 0, u32(1), u32(1), u32(N), u32(1));
+  const stsz = fbox("stsz", 0, 0, u32(0), u32(N), ...samples.map(s => u32(s.length)));
+
+  // stco holds an absolute file offset, which depends on moov's own size, so
+  // build it once to measure and again with the real value. The length cannot
+  // change: only the value inside a fixed-width u32 does.
+  const build = dataStart => box("moov",
+    fbox("mvhd", 0, 0, u32(0), u32(0), u32(MTS), u32(movieDur), u32(0x00010000),
+         u16(0x0100), u8(new Array(10).fill(0)), MATRIX, u8(new Array(24).fill(0)), u32(2)),
+    box("trak",
+      fbox("tkhd", 0, 3, u32(0), u32(0), u32(1), u32(0), u32(movieDur),
+           u8(new Array(8).fill(0)), u16(0), u16(0), u16(0), u16(0), MATRIX,
+           u32(w * 65536), u32(h * 65536)),
+      box("mdia",
+        fbox("mdhd", 0, 0, u32(0), u32(0), u32(TS), u32(mediaDur), u16(0x55C4), u16(0)),
+        fbox("hdlr", 0, 0, u32(0), str("vide"), u8(new Array(12).fill(0)), str("VideoHandler\0")),
+        box("minf",
+          fbox("vmhd", 0, 1, u16(0), u16(0), u16(0), u16(0)),
+          box("dinf", fbox("dref", 0, 0, u32(1), fbox("url ", 0, 1))),
+          box("stbl", stsd, stts, stss, stsc, stsz,
+              fbox("stco", 0, 0, u32(1), u32(dataStart)))))));
+
+  const ftyp = box("ftyp", str("isom"), u32(512), str("isom"), str("iso2"), str("avc1"), str("mp41"));
+  const moov = build(ftyp.length + build(0).length + 8);
+  let total = 0; for (const s of samples) total += s.length;
+  return cat([ftyp, moov, cat([u32(total + 8), str("mdat"), ...samples])]);
+}
+
+const CODECS = ["avc1.640034", "avc1.640033", "avc1.64002a", "avc1.640028"];
+// A MessageChannel turn is not throttled in a background tab; setTimeout is.
+const yieldNow = () => new Promise(r => {
+  const ch = new MessageChannel(); ch.port1.onmessage = () => r(); ch.port2.postMessage(0);
+});
+
+async function encoderConfig() {
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") return null;
+  for (const codec of CODECS) {
+    const cfg = { codec, width: W, height: H, bitrate: 20000000,
+                  framerate: CONFIG.fps, avc: { format: "avc" } };
+    try { const s = await VideoEncoder.isConfigSupported(cfg); if (s && s.supported) return cfg; }
+    catch (err) { /* try the next one */ }
+  }
+  return null;
+}
+
+let exporting = false;
+
+async function exportFilm() {
+  if (exporting || recording) return;
+  const cfg = await encoderConfig();
+  if (!cfg) return startRecording();                  // no WebCodecs: real-time fallback
+
+  exporting = true;
+  saveBtn.disabled = true;
+  const wasPlaying2 = playing;
+  playing = false;
+
+  const samples = [], syncs = [];
+  let avcc = null, failed = null, lastTs = -1, ordered = true;
+
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && meta.decoderConfig.description && !avcc)
+        avcc = new Uint8Array(meta.decoderConfig.description);
+      if (chunk.timestamp <= lastTs) ordered = false;  // B-frames would need ctts
+      lastTs = chunk.timestamp;
+      const d = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(d);
+      if (chunk.type === "key") syncs.push(samples.length + 1);
+      samples.push(d);
+    },
+    error: e => { failed = e.message; }
+  });
+  enc.configure(cfg);
+
+  const us = 1e6 / CONFIG.fps;
+  for (let n = 0; n < TOTAL_FRAMES && !failed; n++) {
+    clock = n / CONFIG.fps;
+    render(clock);
+    const frame = new VideoFrame(canvas, {
+      timestamp: Math.round(n * us), duration: Math.round(us)
+    });
+    enc.encode(frame, { keyFrame: n % CONFIG.fps === 0 });
+    frame.close();
+    while (enc.encodeQueueSize > 6 && !failed) await yieldNow();   // backpressure
+    if (n % 15 === 0) {
+      setStatus("rendering " + Math.round((n + 1) / TOTAL_FRAMES * 100) + "%", true);
+      await yieldNow();
+    }
+  }
+
+  try { await enc.flush(); } catch (err) { failed = failed || err.message; }
+  try { enc.close(); } catch (err) { /* already closed on error */ }
+
+  const restore = () => { exporting = false; saveBtn.disabled = false;
+                          last = performance.now(); playing = wasPlaying2;
+                          toggleBtn.textContent = playing ? "Pause" : "Play"; };
+
+  // Refuse to write a file we cannot vouch for; fall back rather than ship a
+  // subtly broken one.
+  if (failed || !avcc || !ordered || samples.length !== TOTAL_FRAMES) {
+    setStatus(failed ? "encoder error: " + failed
+              : !ordered ? "encoder reordered frames — using capture"
+              : "encode incomplete — using capture", true);
+    restore();
+    return startRecording();
+  }
+
+  setStatus("writing mp4...", true);
+  await yieldNow();
+  const blob = new Blob([muxMP4(samples, syncs, avcc, W, H, CONFIG.fps)], { type: "video/mp4" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "iris-1080x1920.mp4";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  setStatus("saved .mp4  " + TOTAL_FRAMES + " frames  " + DURATION.toFixed(1) + "s  "
+            + (blob.size / 1048576).toFixed(1) + " MB", true);
+  restore();
+}
+
+saveBtn.addEventListener("click", exportFilm);
 // if the tab is hidden mid-take the stream starves, so abandon it honestly
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && recording) {
