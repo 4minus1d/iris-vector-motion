@@ -166,12 +166,24 @@ taken during a pane resize. Verify a suspicious result before "fixing" it.
 
 ## Export
 
-`canvas.captureStream()` → `MediaRecorder`, MP4/H.264 preferred, WebM fallback.
+`canvas.captureStream(0)` + explicit `track.requestFrame()` → `MediaRecorder`,
+MP4/H.264 preferred, WebM fallback.
 
-**It is a real-time capture** — a 15 s film takes 15 s, and **the tab must stay
-visible**. A hidden tab stops painting and the recording stalls at 0 % forever.
-The Save button guards against this; keep that guard. A frame-exact offline
-render would require writing an encoder.
+**While capturing, animation time is a fixed timestep** — `clock = frame / fps`,
+never elapsed wall-clock delta. Wall time only decides *when* to emit, and at
+most one frame per tick. This is not a preference: driving the capture clock
+from `dt` bakes encoder warm-up directly into the motion (45 ms steps instead of
+16.7 ms — the stutter that used to appear in the first second of every file).
+Playback uses elapsed time; capture must not. See ANIMATION-SYSTEM.md §9.1.
+
+Also load-bearing, do not remove: the encoder is **primed** with a throwaway
+recorder before the real take, and UI/DOM writes are **throttled** to ~5/s
+during capture rather than running every frame.
+
+**It is still a real-time capture** — a 15 s film takes 15 s, and **the tab must
+stay visible**. A hidden tab stops painting and the recording stalls at 0 %
+forever. The Save button guards against this; keep that guard. A frame-exact
+offline render would require WebCodecs plus a hand-written muxer.
 
 ---
 

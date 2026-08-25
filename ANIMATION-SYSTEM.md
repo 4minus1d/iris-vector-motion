@@ -519,7 +519,7 @@ suspicious result before acting on it.
 
 ## 9. Export
 
-`canvas.captureStream(fps)` → `MediaRecorder`, no libraries.
+`canvas.captureStream` → `MediaRecorder`, no libraries.
 
 ```js
 MIMES = ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1.42E01E",
@@ -530,12 +530,88 @@ videoBitsPerSecond: 24_000_000
 
 Prefer MP4/H.264 where supported (Chrome does), fall back through VP9/VP8 WebM.
 
-**It is a real-time capture.** Recording a 15 s film takes 15 s. Measured
-accuracy: 15066 ms against a 15.00 s target — frame-accurate.
+### 9.1 Never drive the recording clock from elapsed time
+
+This is the single most important rule in this section, and it was learned from
+a real defect: **stutter in the first second of every saved file.**
+
+The naive capture loop advances the animation by measured wall-clock delta:
+
+```js
+const dt = (now - last) / 1000;      // ✗ WRONG while recording
+recClock += dt;
+```
+
+That is correct for *playback* and wrong for *capture*. Encoder construction,
+GPU buffer allocation and the first keyframe are expensive, so the opening
+frames of a take run long. With a wall-clock delta, a frame that took 45 ms
+advances the animation by 45 ms — so the motion **leaps forward** during
+warm-up and then settles back to normal speed once the encoder catches up.
+
+The frames are not dropped. The judder is baked into the motion.
+
+Simulated against a realistic tick sequence — eight frames stalling at 45 ms,
+then clean 60 Hz:
+
+| | first eight animation steps | jitter |
+|---|---|---|
+| wall-clock `dt` | `45.0, 45.0, 45.0, 45.0, 45.0, 45.0, 45.0, 16.7` ms | **28.33 ms** |
+| fixed timestep | `16.7 × 8` ms | **0.00 ms** |
+
+**The rule: while capturing, animation time is a fixed timestep.**
+
+```js
+clock = frame / CONFIG.fps;     // frame n is ALWAYS exactly n/fps
+```
+
+Wall time then decides only *when* to emit, which keeps playback speed correct
+across refresh rates:
+
+```js
+if (Math.floor((now - t0) / FRAME_MS) < frame) return;   // not due yet
+```
+
+Emit **at most one frame per tick**. Never catch up by bunching several frames
+into the same instant — MediaRecorder timestamps by arrival, so bunching
+produces exactly the artifact you are trying to avoid. Verified: 900 frames from
+a clean 60 Hz sequence, and 50 % of ticks consumed on a 120 Hz display (correct
+60 fps rather than double speed).
+
+### 9.2 Capture frames manually
+
+```js
+const stream = canvas.captureStream(0);          // 0 = capture only on request
+const track  = stream.getVideoTracks()[0];
+// … per frame:
+render(clock);
+track.requestFrame();
+```
+
+`frameRate: 0` means nothing is captured until asked. One `requestFrame` per
+rendered frame: no duplicates from an incidental repaint, no drops from a missed
+one. Feature-detect `track.requestFrame` and fall back to `captureStream(fps)`.
+
+### 9.3 Prime the encoder
+
+Build a throwaway `MediaRecorder` on the same stream, push ~10 frames through
+it, stop it and discard the blob. This pays for codec setup, GPU allocation and
+the first keyframe *before* the real take starts. Guard it with a timeout so a
+quirky implementation cannot hang the button.
+
+### 9.4 Do not write to the DOM every frame
+
+The original loop set `scrub.value`, `clockLbl.textContent` and a status string
+on every tick — three style invalidations per frame, competing with the encoder
+exactly when it is busiest. Throttle UI updates to ~5/second during capture.
+
+### 9.5 It is still a real-time capture
+
+Recording a 15 s film takes 15 s. Measured accuracy on the previous
+implementation: 15066 ms against a 15.00 s target.
 
 **A hidden tab stops painting.** `requestAnimationFrame` halts, the capture
 stream receives nothing, and the recording sits at 0 % forever. There is no way
-around this for canvas capture; the fix is to detect and say so:
+around this for canvas capture; detect and say so:
 
 ```js
 if (document.hidden) { setStatus("keep this tab visible to record"); return; }
@@ -545,8 +621,10 @@ if (document.hidden) { setStatus("keep this tab visible to record"); return; }
 *Learned by hitting it.* A recording silently stalled at 0 % with
 `document.hidden === true`. Failing loudly beats failing silently.
 
-**A frame-exact offline render would need its own encoder.** MediaRecorder is
-real-time only. Accept it or write an encoder.
+**A frame-exact offline render would need its own encoder** — WebCodecs
+`VideoEncoder` plus a hand-written muxer. That removes the real-time constraint
+entirely and is the correct answer if capture quality ever stops being good
+enough. MediaRecorder alone is real-time only.
 
 ---
 
@@ -724,6 +802,13 @@ better than a ramp from nothing when the subject *is* acceleration.
 ### 12.13 Trusting a screenshot over the pixels
 A frame that looked wrong was a stale read taken during a pane resize. Measure
 before you "fix."
+
+### 12.14 A capture clock driven by elapsed time
+Every saved file stuttered in its first second. The encoder's warm-up cost made
+the opening frames run long, and because the animation advanced by measured
+`dt`, the motion leapt forward by however long each stall lasted — 45 ms steps
+instead of 16.7 ms, a 28 ms jitter, baked into the file. Playback wants elapsed
+time; capture wants a fixed timestep. → [§9.1](#91-never-drive-the-recording-clock-from-elapsed-time)
 
 ---
 
