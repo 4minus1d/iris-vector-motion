@@ -36,6 +36,13 @@ legitimate, the camera rig, self-similar travel, the loop contract, the
 verification harness, the direction rules — and a catalogue of every failure
 that shaped them.
 
+**[CLAUDE.md](CLAUDE.md)** is the working contract for anyone (or any agent)
+picking this up: the invariants that break silently, the motion and direction
+rules in short form, and a copy-pasteable verification protocol. It requires
+reading `ANIMATION-SYSTEM.md` before changing animation code, because most
+"obvious" improvements here have already been tried and reverted for reasons
+recorded there.
+
 ## Note
 
 `server.mjs` is a zero-dependency static server for local development only. It
