@@ -10,7 +10,7 @@ generator, one camera rig, one canvas, one exporter, all hand-written.
 
 | File | |
 |---|---|
-| `iris.html` — *Eyes All the Way Down* | Eye → dive → corridor of screens → eye |
+| `iris.html` — *it blinks back* | Eye → dive → corridor of screens → eye |
 | `iris-swipe.html` | Eye → dive → deck of tiles thrown upward by a thumb → eye |
 | `index.html` | The original circle → rounded-square morph test |
 | `server.mjs` | Zero-dependency static server, local dev only |
