@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IRIS — a short film in vectors</title>
+<style>
+  :root { --ink:#fff; --line:#242424; --dim:#7d7d7d; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #070707; color: var(--ink);
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; letter-spacing: .04em;
+  }
+  canvas {
+    display: block; height: min(80vh, 940px); width: auto; aspect-ratio: 9 / 16;
+    background: #000; border: 1px solid var(--line);
+  }
+  .panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; width: min(92vw, 520px); }
+  button {
+    font: inherit; color: var(--ink); background: transparent;
+    border: 1px solid var(--line); padding: 7px 13px; cursor: pointer;
+    transition: background .12s ease, color .12s ease, border-color .12s ease;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: #000; border-color: var(--ink); }
+  button:disabled { opacity: .35; cursor: default; }
+  input[type=range] { flex: 1 1 200px; accent-color: #fff; height: 2px; background: var(--line); cursor: pointer; }
+  .status { color: var(--dim); width: 100%; text-align: center; }
+  .status.on { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<canvas id="stage" width="1080" height="1920"></canvas>
+
+<div class="panel">
+  <button id="toggle">Pause</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+  <span id="clockLabel">0.0s</span>
+  <button id="save">Save video</button>
+  <span class="status" id="status"></span>
+</div>
+
+<script>
+"use strict";
+
+/* ==================================================================
+   IRIS
+
+   An eye opens, and the camera falls into the pupil.
+
+   Beyond it is a corridor of screens. Each one arrives out of the far
+   distance as a circle - an eye - and morphs into a 9:16 rounded
+   rectangle as it reaches you. The opening carries the film's exact
+   aspect ratio, so at the instant you pass through, the screen and the
+   frame are the same shape. Passing through flips the world black to
+   white: the inversions are thresholds, not strobes, and they come
+   faster and faster.
+
+   At the end of the tunnel there is always one small circle that never
+   gets closer. Until you arrive, and it is a pupil, and two lids close
+   around it, and it blinks, and you fall in again.
+
+   We keep building brighter screens, and every one of them is shaped
+   like the eye that made it.
+
+   ---
+   One geometry generator: every shape is an 8-segment cubic Bezier
+   outline of 25 control points, so anything lerps into anything.
+   Nothing is drawn that isn't a vector.
+   ================================================================== */
+
+const CONFIG = { W: 1080, H: 1920, fps: 60, expo: 10 };
+const W = CONFIG.W, H = CONFIG.H;
+
+/* ---------------- timeline (seconds) ---------------- */
+const T = {
+  blinkShut:  0.72,   // a blink: the sign of life
+  blinkOpen:  0.92,
+  dilate:     1.24,   // the pupil widens
+  push:       1.90,   // the dive
+  swap:       2.30,   // through the pupil, in darkness
+  corridor:   2.55,   // the first screen
+  accelEnd:   9.30,   // peak rate
+  decelEnd:  10.65,
+  arrive:     9.60,   // the corridor resolves into an eye
+  arriveEnd: 12.00,
+  end:       15.00
+};
+const DURATION = T.end;
+
+/* ---------------- easing ----------------
+   Used only where a thing genuinely snaps. The corridor runs on a
+   velocity profile and the camera on a spline; neither eases.        */
+const EXPO_NORM = 1 - Math.pow(2, -CONFIG.expo);
+const EASE = {
+  expo:   t => t <= 0 ? 0 : t >= 1 ? 1 : (1 - Math.pow(2, -CONFIG.expo * t)) / EXPO_NORM,
+  glide:  t => t <= 0 ? 0 : t >= 1 ? 1 : 1 - Math.pow(1 - t, 4),
+  smooth: t => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t)
+};
+// exact at the endpoints: a + (b-a)*1 is not reliably b in floating point,
+// and a few ULPs of drift is enough to shift an antialiased edge.
+const mix = (a, b, t) => t >= 1 ? b : t <= 0 ? a : a + (b - a) * t;
+const clamp01 = t => t < 0 ? 0 : t > 1 ? 1 : t;
+function seg(time, t0, t1) { return t1 <= t0 ? (time >= t1 ? 1 : 0) : clamp01((time - t0) / (t1 - t0)); }
+function eseg(time, t0, t1, e) { return EASE[e || "expo"](seg(time, t0, t1)); }
+
+/* ---------------- geometry ---------------- */
+const KAPPA = 0.5522847498307936;
+
+function outline(w, h, corners) {
+  const a = w / 2, b = h / 2;
+  const c = corners.map(r => [Math.min(r[0], a), Math.min(r[1], b)]);
+  const TR = c[0], BR = c[1], BL = c[2], TL = c[3];
+  const P = [];
+  const push = (x, y) => P.push({ x: x, y: y });
+  const edge = (x0, y0, x1, y1) => {           // straight run as a cubic
+    push(x0 + (x1 - x0) / 3, y0 + (y1 - y0) / 3);
+    push(x0 + (x1 - x0) * 2 / 3, y0 + (y1 - y0) * 2 / 3);
+    push(x1, y1);
+  };
+  const k = r => KAPPA * r;
+
+  push(-a + TL[0], -b);
+  edge(-a + TL[0], -b, a - TR[0], -b);
+  push(a - TR[0] + k(TR[0]), -b); push(a, -b + TR[1] - k(TR[1])); push(a, -b + TR[1]);
+  edge(a, -b + TR[1], a, b - BR[1]);
+  push(a, b - BR[1] + k(BR[1])); push(a - BR[0] + k(BR[0]), b); push(a - BR[0], b);
+  edge(a - BR[0], b, -a + BL[0], b);
+  push(-a + BL[0] - k(BL[0]), b); push(-a, b - BL[1] + k(BL[1])); push(-a, b - BL[1]);
+  edge(-a, b - BL[1], -a, -b + TL[1]);
+  push(-a, -b + TL[1] - k(TL[1])); push(-a + TL[0] - k(TL[0]), -b); push(-a + TL[0], -b);
+  return P;
+}
+
+const disc  = d => outline(d, d, [[d/2,d/2],[d/2,d/2],[d/2,d/2],[d/2,d/2]]);
+const rrect = (w, h, r) => outline(w, h, [[r,r],[r,r],[r,r],[r,r]]);
+// wide arch on top, square below: the eyelids are this.
+const dome  = (w, h, arch) => outline(w, h, [[w/2, arch], [0,0], [0,0], [w/2, arch]]);
+
+const tp = (P, x, y) => P.map(p => ({ x: p.x + x, y: p.y + y }));
+const sp = (P, sx, sy) => P.map(p => ({ x: p.x * sx, y: p.y * sy }));
+function lerpP(A, B, t) {
+  if (t >= 1) return B;
+  if (t <= 0) return A;
+  return A.map((p, i) => ({ x: p.x + (B[i].x - p.x) * t, y: p.y + (B[i].y - p.y) * t }));
+}
+
+/* ---------------- canvas ---------------- */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+
+function trace(P) {
+  ctx.beginPath();
+  ctx.moveTo(P[0].x, P[0].y);
+  for (let i = 1; i < P.length; i += 3) ctx.bezierCurveTo(P[i].x, P[i].y, P[i+1].x, P[i+1].y, P[i+2].x, P[i+2].y);
+  ctx.closePath();
+}
+function fillS(P, style) { trace(P); ctx.fillStyle = style; ctx.fill(); }
+function strokeS(P, style, lw) { trace(P); ctx.strokeStyle = style; ctx.lineWidth = lw; ctx.stroke(); }
+function flood(style) { ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle = style; ctx.fillRect(0,0,W,H); }
+
+/* ---------------- camera ----------------
+   One closed Hermite spline for the whole loop, tangents taken as finite
+   differences in real time. Position and velocity are continuous across
+   every key and across the seam, so the camera never eases into a stop -
+   it is still travelling as it crosses frame zero.
+
+   ZOOM is monotonic: the last three seconds and the first two are a
+   single accelerating push, so you are always falling into the eye. It
+   turns around exactly twice - at the apex, hidden inside the blackout,
+   and at the wide point, buried in the lid sweep where the shapes are
+   moving hardest.
+
+   ROLL only ever sways a few degrees. A continuous barrel roll looked
+   impressive on its own and was wrong: the screens have the frame's
+   aspect ratio, and the whole point is that they line up with its edges
+   as they swallow you. Spinning the camera means they never do.        */
+const CAM = [
+  { t:  0.00, x:   0, y:   0, z:  1.000, r:  0.000 },   // the frame you stop on
+  { t:  0.85, x: -46, y: -24, z:  1.350, r:  0.045 },
+  { t:  1.70, x: -78, y:  36, z:  2.600, r:  0.100 },
+  { t:  2.05, x: -30, y:  18, z: 11.000, r:  0.060 },   // diving
+  { t:  2.30, x:   0, y:   0, z: 46.000, r:  0.000 },   // apex, parked inside the black
+  { t:  2.55, x:   0, y:   0, z:  4.000, r: -0.060 },   // still black
+  { t:  2.90, x:  18, y: -14, z:  1.250, r: -0.110 },
+  { t:  3.90, x: 118, y: -68, z:  1.200, r: -0.055 },
+  { t:  5.00, x: -78, y: 104, z:  1.150, r:  0.070 },
+  { t:  6.10, x: 132, y:  86, z:  1.100, r:  0.120 },
+  { t:  7.20, x:-126, y: -76, z:  1.050, r:  0.040 },
+  { t:  8.30, x:  92, y:-112, z:  1.000, r: -0.080 },
+  { t:  9.40, x: -98, y:  62, z:  0.940, r: -0.125 },
+  { t: 10.50, x:  26, y:  34, z:  0.860, r: -0.070 },
+  { t: 11.40, x:  46, y: -18, z:  0.640, r:  0.030 },   // widest — inside the lid sweep
+  { t: 12.60, x: -30, y:  26, z:  0.720, r:  0.090 },
+  { t: 13.70, x:  38, y:  20, z:  0.850, r:  0.050 }
+];
+const ADV = [0, 0, 0, 0];   // every channel closes on itself over one loop
+
+const CAM_K = CAM.map(k => ({ t: k.t, v: [k.x, k.y, Math.log(k.z), k.r] }));
+const CAM_D = CAM_K.map((k, i) => {
+  const d = CAM_K[(i + 1) % CAM_K.length].t - k.t;
+  return d > 0 ? d : d + T.end;
+});
+const CAM_M = CAM_K.map((k, i) => {
+  const n = CAM_K.length;
+  const prev = CAM_K[(i - 1 + n) % n].v.map((v, c) => v - (i === 0 ? ADV[c] : 0));
+  const next = CAM_K[(i + 1) % n].v.map((v, c) => v + (i === n - 1 ? ADV[c] : 0));
+  const span = CAM_D[(i - 1 + n) % n] + CAM_D[i];
+  return next.map((v, c) => (v - prev[c]) / span);
+});
+
+function sampleCam(time) {
+  const n = CAM_K.length;
+  const t = ((time % T.end) + T.end) % T.end;
+  let i = n - 1;
+  for (let k = 0; k < n; k++) { if (t >= CAM_K[k].t) i = k; else break; }
+  const j = (i + 1) % n, d = CAM_D[i];
+  const u = clamp01((t - CAM_K[i].t) / d);
+  const u2 = u * u, u3 = u2 * u;
+  const h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u, h01 = -2*u3 + 3*u2, h11 = u3 - u2;
+  const o = [0, 0, 0, 0];
+  for (let c = 0; c < 4; c++) {
+    const vj = CAM_K[j].v[c] + (j === 0 ? ADV[c] : 0);
+    o[c] = h00 * CAM_K[i].v[c] + h10 * d * CAM_M[i][c] + h01 * vj + h11 * d * CAM_M[j][c];
+  }
+  return { x: o[0], y: o[1], z: Math.exp(o[2]), r: o[3] };
+}
+function setCam(cam) {
+  const z = cam.z;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.translate(W / 2, H / 2);
+  ctx.rotate(cam.r);
+  ctx.scale(z, z);
+  ctx.translate(-cam.x, -cam.y);
+}
+/* A screen's sideways displacement has to scale with how near it is, or every
+   screen slides by the same amount and the tunnel reads as one flat thing
+   inflating instead of rushing past. Placing screen n at this world position
+   puts it at axis offset -cam * near, which is that parallax - and lands it
+   at the world origin exactly when near reaches 1.                          */
+const perspective = (cam, near) => [cam.x * (1 - near), cam.y * (1 - near)];
+
+/* ---------------- the eye ---------------- */
+const EYE = {
+  half: 450,            // aperture half-width: the corners never move
+  gap: 430,             // aperture height at centre
+  lidW: 4000, lidH: 20000,
+  pupilD: 290, ringD: 370, ringW: 13,
+  catchD: 48, catchX: -95, catchY: -72
+};
+// Arc depth that puts both lid edges through the fixed corners. As the gap
+// closes the arcs flatten, so a blink slides shut instead of shrinking.
+const K_RY = 1 / (1 - Math.sqrt(1 - Math.pow(EYE.half / (EYE.lidW / 2), 2))) / 2;
+const lidShape = gap => dome(EYE.lidW, EYE.lidH, K_RY * gap);
+const lowerLid = gap => tp(lidShape(gap), 0, gap / 2 + EYE.lidH / 2);
+const upperLid = gap => sp(lowerLid(gap), 1, -1);
+
+/* ---------------- the corridor ----------------
+   Screens sit at geometric depths, each one CORR.k times nearer than the
+   one behind it. Travel is measured in screens passed, q, so the whole
+   corridor is self-similar: advancing q by 1 scales the world by k and
+   drops the nearest screen, and the pattern repeats exactly. That is what
+   makes it endless without ever repeating a keyframe.
+
+   The opening is 9:16 - the film's own aspect - so at the moment a screen
+   swallows the camera, its edges and the frame's edges coincide.        */
+const CORR = {
+  k: 2.2,        // scale ratio between neighbouring screens
+  base: 980,     // size of the nearest screen at q exactly integer
+  shown: 7,      // screens drawn; beyond this they are sub-pixel
+  morphIn: -3.4, // distance at which a far circle starts becoming a screen
+  morphOut: -1.0
+};
+
+// Travel: accelerates from a measured drift to a frantic rate, then decays
+// to rest as the corridor arrives. Velocity is continuous and never zero
+// while anything is visible.
+const Q = { v0: 0.75, v1: 4.20 };
+const Q_U = T.accelEnd - T.corridor;
+const Q_TAU = T.decelEnd - T.accelEnd;
+const Q_A = Q.v0 * Q_U + (Q.v1 - Q.v0) * Q_U / 3;
+const Q_END = Q_A + Q.v1 * Q_TAU * 0.5;
+
+function qAt(time) {
+  if (time <= T.corridor) return 0;
+  if (time <= T.accelEnd) {
+    const u = time - T.corridor;
+    return Q.v0 * u + (Q.v1 - Q.v0) * u * u * u / (3 * Q_U * Q_U);
+  }
+  if (time >= T.decelEnd) return Q_END;
+  const s = (time - T.accelEnd) / Q_TAU;
+  return Q_A + Q.v1 * Q_TAU * (s / 2 + Math.sin(Math.PI * s) / (2 * Math.PI));
+}
+
+// far away it is a circle - an eye; near, a 9:16 screen
+function portalShape(s, m) {
+  if (m <= 0) return disc(s);
+  const h = s * 1.14, w = h * 0.5625;
+  return lerpP(disc(s), rrect(w, h, w * 0.14), m);
+}
+
+/* ---------------- render ---------------- */
+function render(time) {
+  const cam = sampleCam(time);
+  if (time < T.swap) { flood("#fff"); drawEye(time, cam); }
+  else drawCorridor(time, cam);
+}
+
+function drawEye(time, cam) {
+  const shut = eseg(time, T.blinkShut - 0.22, T.blinkShut, "expo");
+  const open = eseg(time, T.blinkShut, T.blinkOpen, "expo");
+  const gap  = mix(mix(EYE.gap, 14, shut), EYE.gap, open);
+
+  const dil = eseg(time, T.dilate, T.push, "expo");
+  const pd  = mix(EYE.pupilD, EYE.pupilD * 1.20, dil);
+  const rd  = mix(EYE.ringD, EYE.ringD * 1.10, dil);
+
+  const out  = eseg(time, 0.30, 0.62, "expo");     // a glance away and back
+  const back = eseg(time, 0.98, T.dilate, "expo");
+  const px = mix(mix(0, -26, out), 0, back);
+
+  setCam(cam);
+  fillS(tp(disc(pd), px, 0), "#000");
+  strokeS(tp(disc(rd), px, 0), "#000", EYE.ringW);
+  fillS(tp(disc(EYE.catchD), px + EYE.catchX, EYE.catchY), "#fff");
+  fillS(lowerLid(gap), "#000");
+  fillS(upperLid(gap), "#000");
+}
+
+function drawCorridor(time, cam) {
+  const q = qAt(time);
+  const fl = Math.floor(q), f = q - fl;
+  // Openings dilate out of the black we arrived in - the corridor opens like
+  // an aperture - and close again as it resolves into the eye it was inside.
+  const entry = eseg(time, T.swap, T.corridor + 0.30, "glide");
+  // The nearest screen does not fade out. It stops being a screen: the tall
+  // rounded rectangle morphs into the circle and stays as the pupil - the same
+  // circle-to-rounded-rect morph the whole film is built from, run backwards.
+  // starts only once the travel has stopped, so it is the last screen that
+  // transforms rather than every screen shrinking on its way past
+  const become = eseg(time, T.decelEnd - 0.20, T.arriveEnd - 0.30, "glide");
+  const recede = eseg(time, T.decelEnd - 0.45, T.decelEnd + 0.35, "glide");   // the ones behind clear out first
+
+  const col = n => ((fl + n) % 2 === 0) ? "#000" : "#fff";
+  function screen(n) {
+    const rel = f - n;
+    let near = Math.pow(CORR.k, rel);       // 1 at the reference depth, larger when closer
+    let s = CORR.base * near * entry;
+    let m = clamp01((rel - CORR.morphIn) / (CORR.morphOut - CORR.morphIn));
+    if (n === 0) { s = mix(s, EYE.pupilD, become); near = mix(near, 1, become); m = mix(m, 0, become); }
+    else s = mix(s, 0, recede);
+    return { s: s, near: near, m: m };
+  }
+
+  ctx.save();
+  let n = 0;
+  for (; n < CORR.shown; n++) {
+    // Paint the wall. The live clip is the previous screen's opening, so
+    // this lands as the band between that opening and this one.
+    flood(col(n));
+
+    const a = screen(n);
+    if (a.s < 1) break;                     // no opening left: this colour fills the rest
+    const off = perspective(cam, a.near);
+    const shape = tp(portalShape(a.s, a.m), off[0], off[1]);
+    setCam(cam);
+    // The innermost opening is filled rather than clipped: a clip boundary is
+    // hard-edged where a fill is antialiased, and the last one becomes the pupil.
+    if (n === CORR.shown - 1 || screen(n + 1).s < 1) { fillS(shape, col(n + 1)); break; }
+    trace(shape);
+    ctx.clip();
+  }
+  ctx.restore();
+
+  /* --- the eye closes around it ---
+     Drawn as real filled paths in the same order as drawEye, not left as
+     the clip edge: a clip boundary is hard-edged where a fill is
+     antialiased, and the loop has to close on identical pixels.        */
+  setCam(cam);
+  const rd = EYE.ringD * eseg(time, T.decelEnd + 0.35, T.arriveEnd - 0.10, "glide");
+  if (rd > 1) strokeS(disc(rd), "#000", EYE.ringW * (rd / EYE.ringD));
+
+  const cl = EYE.catchD * eseg(time, T.arriveEnd - 0.9, T.arriveEnd + 0.6, "glide");
+  if (cl > 0.5) fillS(tp(disc(cl), EYE.catchX, EYE.catchY), "#fff");
+
+  const sweep = eseg(time, T.decelEnd + 0.25, T.arriveEnd + 0.2, "glide");
+  if (sweep > 0) {
+    fillS(tp(lowerLid(EYE.gap), 0, mix(2600, 0, sweep)), "#000");
+    fillS(tp(upperLid(EYE.gap), 0, mix(-2600, 0, sweep)), "#000");
+  }
+}
+
+/* ---------------- clock ---------------- */
+let playing = true, clock = 0, last = performance.now(), recording = false, recClock = 0;
+const statusEl = document.getElementById("status");
+const saveBtn  = document.getElementById("save");
+const toggleBtn= document.getElementById("toggle");
+const scrub    = document.getElementById("scrub");
+const clockLbl = document.getElementById("clockLabel");
+
+function setStatus(text, on) { statusEl.textContent = text; statusEl.classList.toggle("on", !!on); }
+
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (recording) { recClock += dt; clock = recClock; }
+  else if (playing) { clock = (clock + dt) % DURATION; }
+
+  render(clock);
+  scrub.value = String(Math.round((clock / DURATION) * 1000));
+  clockLbl.textContent = clock.toFixed(1) + "s";
+
+  if (recording) {
+    setStatus("recording... " + Math.min(100, Math.round(recClock / DURATION * 100)) + "%", true);
+    if (recClock >= DURATION - 0.5 / CONFIG.fps) stopRecording();
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ---------------- export ---------------- */
+const MIMES = ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1.42E01E", "video/mp4",
+               "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return null;
+  for (const m of MIMES) if (MediaRecorder.isTypeSupported(m)) return m;
+  return null;
+}
+
+let recorder = null, chunks = [], wasPlaying = true;
+
+function startRecording() {
+  const mime = pickMime();
+  if (!mime) { setStatus("MediaRecorder unsupported in this browser", true); return; }
+  // A hidden tab stops painting, requestAnimationFrame halts, and the capture
+  // stream receives nothing - the recording would just sit at 0%. Say so.
+  if (document.hidden) { setStatus("keep this tab visible to record", true); return; }
+  const stream = canvas.captureStream(CONFIG.fps);
+  try { recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 }); }
+  catch (err) { setStatus("recorder failed: " + err.message, true); return; }
+
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: mime });
+    const ext = mime.indexOf("video/mp4") === 0 ? "mp4" : "webm";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "iris-1080x1920." + ext;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    setStatus("saved ." + ext + "  " + DURATION.toFixed(1) + "s  " + (blob.size / 1048576).toFixed(1) + " MB", true);
+    saveBtn.disabled = false;
+    playing = wasPlaying;
+    toggleBtn.textContent = playing ? "Pause" : "Play";
+  };
+
+  wasPlaying = playing;
+  saveBtn.disabled = true;
+  recClock = 0; clock = 0; recording = true;
+  render(0);
+  recorder.start(100);
+  setStatus("recording... 0%", true);
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  setStatus("encoding...", true);
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+saveBtn.addEventListener("click", () => { if (!recording) startRecording(); });
+// if the tab is hidden mid-take the stream starves, so abandon it honestly
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && recording) {
+    recording = false;
+    if (recorder && recorder.state !== "inactive") { recorder.onstop = null; recorder.stop(); }
+    saveBtn.disabled = false;
+    setStatus("recording cancelled — tab was hidden", true);
+  }
+});
+toggleBtn.addEventListener("click", () => {
+  if (recording) return;
+  playing = !playing;
+  toggleBtn.textContent = playing ? "Pause" : "Play";
+});
+scrub.addEventListener("input", () => {
+  if (recording) return;
+  clock = (Number(scrub.value) / 1000) * DURATION;
+  playing = false; toggleBtn.textContent = "Play";
+  render(clock);
+});
+document.addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); toggleBtn.click(); }
+});
+
+setStatus("IRIS  ·  1080 x 1920  ·  " + DURATION.toFixed(1) + "s loop  ·  " + CONFIG.fps + " fps");
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

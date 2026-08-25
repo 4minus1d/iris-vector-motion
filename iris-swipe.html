@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IRIS / SWIPE — a short film in vectors</title>
+<style>
+  :root { --ink:#fff; --line:#242424; --dim:#7d7d7d; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #070707; color: var(--ink);
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; letter-spacing: .04em;
+  }
+  canvas {
+    display: block; height: min(80vh, 940px); width: auto; aspect-ratio: 9 / 16;
+    background: #000; border: 1px solid var(--line);
+  }
+  .panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; width: min(92vw, 520px); }
+  button {
+    font: inherit; color: var(--ink); background: transparent;
+    border: 1px solid var(--line); padding: 7px 13px; cursor: pointer;
+    transition: background .12s ease, color .12s ease, border-color .12s ease;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: #000; border-color: var(--ink); }
+  button:disabled { opacity: .35; cursor: default; }
+  input[type=range] { flex: 1 1 200px; accent-color: #fff; height: 2px; background: var(--line); cursor: pointer; }
+  .status { color: var(--dim); width: 100%; text-align: center; }
+  .status.on { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<canvas id="stage" width="1080" height="1920"></canvas>
+
+<div class="panel">
+  <button id="toggle">Pause</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+  <span id="clockLabel">0.0s</span>
+  <button id="save">Save video</button>
+  <span class="status" id="status"></span>
+</div>
+
+<script>
+"use strict";
+
+/* ==================================================================
+   IRIS / SWIPE
+
+   An eye opens, and the camera falls into the pupil.
+
+   Beyond it is a deck of tiles, and a finger throwing them away. Each
+   tile carries a small picture of an eye. The finger arrives, flicks,
+   and the whole frame turns over black to white as the next tile is
+   uncovered - the inversions are the gesture, not an effect. It gets
+   faster. By the end the finger is barely arriving before it leaves.
+
+   The last tile is thrown, and the small picture of an eye on the one
+   beneath it does not get thrown away. It grows, and two lids close
+   around it, and it blinks, and you fall in again.
+
+   You swipe past every image of the thing, and the thing is watching.
+
+   ---
+   One geometry generator: every shape is an 8-segment cubic Bezier
+   outline of 25 control points, so anything lerps into anything. The
+   finger is that same generator with a semicircular cap.
+   ================================================================== */
+
+const CONFIG = { W: 1080, H: 1920, fps: 60, expo: 10 };
+const W = CONFIG.W, H = CONFIG.H;
+
+/* ---------------- timeline (seconds) ---------------- */
+const T = {
+  blinkShut:  0.72,   // a blink: the sign of life
+  blinkOpen:  0.92,
+  dilate:     1.24,   // the pupil widens
+  push:       1.90,   // the dive
+  swap:       2.30,   // through the pupil, in darkness
+  deck:       2.55,   // the first tile
+  accelEnd:   9.30,   // peak rate
+  decelEnd:  10.65,
+  arrive:     9.60,   // the last tile is not thrown away
+  arriveEnd: 12.00,
+  end:       15.00
+};
+const DURATION = T.end;
+
+/* ---------------- easing ----------------
+   Used only where a thing genuinely snaps: the blink, and the flick.
+   The deck runs on a velocity profile and the camera on a spline.     */
+const EXPO_NORM = 1 - Math.pow(2, -CONFIG.expo);
+const EASE = {
+  expo:   t => t <= 0 ? 0 : t >= 1 ? 1 : (1 - Math.pow(2, -CONFIG.expo * t)) / EXPO_NORM,
+  glide:  t => t <= 0 ? 0 : t >= 1 ? 1 : 1 - Math.pow(1 - t, 4),
+  smooth: t => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t)
+};
+const mix = (a, b, t) => t >= 1 ? b : t <= 0 ? a : a + (b - a) * t;
+const clamp01 = t => t < 0 ? 0 : t > 1 ? 1 : t;
+function seg(time, t0, t1) { return t1 <= t0 ? (time >= t1 ? 1 : 0) : clamp01((time - t0) / (t1 - t0)); }
+function eseg(time, t0, t1, e) { return EASE[e || "expo"](seg(time, t0, t1)); }
+
+/* ---------------- geometry ---------------- */
+const KAPPA = 0.5522847498307936;
+
+function outline(w, h, corners) {
+  const a = w / 2, b = h / 2;
+  const c = corners.map(r => [Math.min(r[0], a), Math.min(r[1], b)]);
+  const TR = c[0], BR = c[1], BL = c[2], TL = c[3];
+  const P = [];
+  const push = (x, y) => P.push({ x: x, y: y });
+  const edge = (x0, y0, x1, y1) => {
+    push(x0 + (x1 - x0) / 3, y0 + (y1 - y0) / 3);
+    push(x0 + (x1 - x0) * 2 / 3, y0 + (y1 - y0) * 2 / 3);
+    push(x1, y1);
+  };
+  const k = r => KAPPA * r;
+
+  push(-a + TL[0], -b);
+  edge(-a + TL[0], -b, a - TR[0], -b);
+  push(a - TR[0] + k(TR[0]), -b); push(a, -b + TR[1] - k(TR[1])); push(a, -b + TR[1]);
+  edge(a, -b + TR[1], a, b - BR[1]);
+  push(a, b - BR[1] + k(BR[1])); push(a - BR[0] + k(BR[0]), b); push(a - BR[0], b);
+  edge(a - BR[0], b, -a + BL[0], b);
+  push(-a + BL[0] - k(BL[0]), b); push(-a, b - BL[1] + k(BL[1])); push(-a, b - BL[1]);
+  edge(-a, b - BL[1], -a, -b + TL[1]);
+  push(-a, -b + TL[1] - k(TL[1])); push(-a + TL[0] - k(TL[0]), -b); push(-a + TL[0], -b);
+  return P;
+}
+
+const disc  = d => outline(d, d, [[d/2,d/2],[d/2,d/2],[d/2,d/2],[d/2,d/2]]);
+const rrect = (w, h, r) => outline(w, h, [[r,r],[r,r],[r,r],[r,r]]);
+// wide arch on top, square below: the eyelids, and the finger, are this.
+const dome  = (w, h, arch) => outline(w, h, [[w/2, arch], [0,0], [0,0], [w/2, arch]]);
+
+const tp = (P, x, y) => P.map(p => ({ x: p.x + x, y: p.y + y }));
+const sp = (P, sx, sy) => P.map(p => ({ x: p.x * sx, y: p.y * sy }));
+const rp = (P, ang) => { const c = Math.cos(ang), s = Math.sin(ang);
+  return P.map(p => ({ x: p.x * c - p.y * s, y: p.x * s + p.y * c })); };
+// exact at the endpoints, so the tile that becomes the pupil lands on exactly
+// the pupil and the loop closes on identical pixels
+function lerpP(A, B, t) {
+  if (t >= 1) return B;
+  if (t <= 0) return A;
+  return A.map((p, i) => ({ x: p.x + (B[i].x - p.x) * t, y: p.y + (B[i].y - p.y) * t }));
+}
+
+/* ---------------- canvas ---------------- */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+
+function trace(P) {
+  ctx.beginPath();
+  ctx.moveTo(P[0].x, P[0].y);
+  for (let i = 1; i < P.length; i += 3) ctx.bezierCurveTo(P[i].x, P[i].y, P[i+1].x, P[i+1].y, P[i+2].x, P[i+2].y);
+  ctx.closePath();
+}
+function fillS(P, style) { trace(P); ctx.fillStyle = style; ctx.fill(); }
+function strokeS(P, style, lw) { trace(P); ctx.strokeStyle = style; ctx.lineWidth = lw; ctx.stroke(); }
+function flood(style) { ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle = style; ctx.fillRect(0,0,W,H); }
+
+/* ---------------- camera ----------------
+   One closed Hermite spline for the whole loop, tangents taken as finite
+   differences in real time, so position and velocity stay continuous
+   across every key and across the seam - the camera never eases into a
+   stop. Zoom is monotonic: the last three seconds and the first two are
+   one accelerating push, turning around exactly twice, at the apex
+   inside the blackout and at the wide point inside the lid sweep.
+
+   Through the deck the camera stays deliberately calm and close. The
+   tiles are already crossing the frame at speed; a busy camera on top
+   of a busy gesture reads as neither.                                  */
+const CAM = [
+  { t:  0.00, x:   0, y:   0, z:  1.000, r:  0.000 },   // the frame you stop on
+  { t:  0.85, x: -46, y: -24, z:  1.350, r:  0.045 },
+  { t:  1.70, x: -78, y:  36, z:  2.600, r:  0.100 },
+  { t:  2.05, x: -30, y:  18, z: 11.000, r:  0.060 },   // diving
+  { t:  2.30, x:   0, y:   0, z: 46.000, r:  0.000 },   // apex, parked inside the black
+  { t:  2.55, x:   0, y:   0, z:  4.000, r: -0.030 },   // still black
+  { t:  2.90, x:   8, y:  -6, z:  1.280, r: -0.055 },
+  { t:  3.90, x:  28, y: -18, z:  1.235, r: -0.028 },
+  { t:  5.00, x: -20, y:  24, z:  1.190, r:  0.040 },
+  { t:  6.10, x:  32, y:  20, z:  1.145, r:  0.062 },
+  { t:  7.20, x: -28, y: -18, z:  1.100, r:  0.022 },
+  { t:  8.30, x:  22, y: -26, z:  1.055, r: -0.042 },
+  { t:  9.40, x: -24, y:  16, z:  1.010, r: -0.064 },
+  { t: 10.50, x:  14, y:  20, z:  0.960, r: -0.026 },
+  { t: 11.40, x:  34, y: -12, z:  0.760, r:  0.030 },   // widest — inside the lid sweep
+  { t: 12.60, x: -22, y:  20, z:  0.820, r:  0.078 },
+  { t: 13.70, x:  30, y:  16, z:  0.900, r:  0.044 }
+];
+const ADV = [0, 0, 0, 0];   // every channel closes on itself over one loop
+
+const CAM_K = CAM.map(k => ({ t: k.t, v: [k.x, k.y, Math.log(k.z), k.r] }));
+const CAM_D = CAM_K.map((k, i) => {
+  const d = CAM_K[(i + 1) % CAM_K.length].t - k.t;
+  return d > 0 ? d : d + T.end;
+});
+const CAM_M = CAM_K.map((k, i) => {
+  const n = CAM_K.length;
+  const prev = CAM_K[(i - 1 + n) % n].v.map((v, c) => v - (i === 0 ? ADV[c] : 0));
+  const next = CAM_K[(i + 1) % n].v.map((v, c) => v + (i === n - 1 ? ADV[c] : 0));
+  const span = CAM_D[(i - 1 + n) % n] + CAM_D[i];
+  return next.map((v, c) => (v - prev[c]) / span);
+});
+
+function sampleCam(time) {
+  const n = CAM_K.length;
+  const t = ((time % T.end) + T.end) % T.end;
+  let i = n - 1;
+  for (let k = 0; k < n; k++) { if (t >= CAM_K[k].t) i = k; else break; }
+  const j = (i + 1) % n, d = CAM_D[i];
+  const u = clamp01((t - CAM_K[i].t) / d);
+  const u2 = u * u, u3 = u2 * u;
+  const h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u, h01 = -2*u3 + 3*u2, h11 = u3 - u2;
+  const o = [0, 0, 0, 0];
+  for (let c = 0; c < 4; c++) {
+    const vj = CAM_K[j].v[c] + (j === 0 ? ADV[c] : 0);
+    o[c] = h00 * CAM_K[i].v[c] + h10 * d * CAM_M[i][c] + h01 * vj + h11 * d * CAM_M[j][c];
+  }
+  return { x: o[0], y: o[1], z: Math.exp(o[2]), r: o[3] };
+}
+function setCam(cam) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.translate(W / 2, H / 2);
+  ctx.rotate(cam.r);
+  ctx.scale(cam.z, cam.z);
+  ctx.translate(-cam.x, -cam.y);
+}
+
+/* ---------------- the eye ---------------- */
+const EYE = {
+  half: 450, gap: 430,
+  lidW: 4000, lidH: 20000,
+  pupilD: 290, ringD: 370, ringW: 13,
+  catchD: 48, catchX: -95, catchY: -72
+};
+const K_RY = 1 / (1 - Math.sqrt(1 - Math.pow(EYE.half / (EYE.lidW / 2), 2))) / 2;
+const lidShape = gap => dome(EYE.lidW, EYE.lidH, K_RY * gap);
+const lowerLid = gap => tp(lidShape(gap), 0, gap / 2 + EYE.lidH / 2);
+const upperLid = gap => sp(lowerLid(gap), 1, -1);
+
+/* ---------------- the deck ----------------
+   Tiles are stacked in place, so tile n+1 is exactly under tile n. The
+   one underneath is flooded rather than drawn as a rectangle, which
+   guarantees it covers the frame at any zoom; the one on top is a real
+   rounded rectangle, so its edge sweeps across as it is thrown.
+
+   Adjacent tiles are opposite polarity, so every throw turns the whole
+   frame over. That is the inversion, and the gesture is its cause.     */
+// Wider than the frame but shorter, so a tile bleeds off the sides and is
+// letterboxed top and bottom. Those two bands show the tile underneath, which
+// is the opposite polarity - that is what makes a tile read as an object
+// sitting on something rather than as a flat field.
+// Wide enough that a spinning tile never swings a side edge into frame - at
+// 1318 with a 0.17 spin the corners cut in as thin diagonal slivers.
+const TILE = { w: 1560, h: 1680, r: 130, throwDist: 2900, drag: 430, spin: 0.05 };
+// The reach takes most of the beat and the throw is the end of it, so the
+// finger is on screen and moving for three quarters of every cycle.
+const SW = { contact: 0.52, release: 0.76 };
+const MOTIF = 0.70;          // the eye as a picture on a tile, vs. life size
+
+// A throw is not an expo. It starts from rest under the finger, builds, and
+// leaves at full speed - so it eases IN and never decelerates. Expo here made
+// the tile teleport on the contact frame and left dead air behind it.
+const throwEase = p => Math.pow(clamp01(p), 1.8);
+
+// A short gesture, not a journey: the thumb comes up to the lower third,
+// flicks about a tile's-worth upward, and drops back out. The tile outruns it
+// on release - that separation is the throw.
+const FING = { w: 172, len: 3200, stroke: 12, restX: 60, restY: 560, enterY: 1500 };
+
+/* Throws accelerate from deliberate to frantic, then decay to rest as the deck
+   arrives. v1 is tuned so the count lands on an even floor with a low
+   fraction: the last tile is therefore still at rest under the finger, and
+   its polarity is black on a white one beneath - which is what lets it stop
+   being a tile and become the pupil instead of being thrown away.          */
+const SP = { v0: 2.20, v1: 5.60 };
+const SP_U = T.accelEnd - T.deck;
+const SP_TAU = T.decelEnd - T.accelEnd;
+const SP_A = SP.v0 * SP_U + (SP.v1 - SP.v0) * SP_U / 3;
+const SP_END = SP_A + SP.v1 * SP_TAU * 0.5;
+
+function sAt(time) {
+  if (time <= T.deck) return 0;
+  if (time <= T.accelEnd) {
+    const u = time - T.deck;
+    return SP.v0 * u + (SP.v1 - SP.v0) * u * u * u / (3 * SP_U * SP_U);
+  }
+  if (time >= T.decelEnd) return SP_END;
+  const s = (time - T.accelEnd) / SP_TAU;
+  return SP_A + SP.v1 * SP_TAU * (s / 2 + Math.sin(Math.PI * s) / (2 * Math.PI));
+}
+
+const tileCol = k => (k % 2 === 0) ? "#000" : "#fff";
+const tileInk = k => (k % 2 === 0) ? "#fff" : "#000";
+
+/* ---------------- render ---------------- */
+function render(time) {
+  const cam = sampleCam(time);
+  if (time < T.swap) { flood("#fff"); drawEye(time, cam); }
+  else drawDeck(time, cam);
+}
+
+function drawEye(time, cam) {
+  const shut = eseg(time, T.blinkShut - 0.22, T.blinkShut, "expo");
+  const open = eseg(time, T.blinkShut, T.blinkOpen, "expo");
+  const gap  = mix(mix(EYE.gap, 14, shut), EYE.gap, open);
+
+  const dil = eseg(time, T.dilate, T.push, "expo");
+  const pd  = mix(EYE.pupilD, EYE.pupilD * 1.20, dil);
+  const rd  = mix(EYE.ringD, EYE.ringD * 1.10, dil);
+
+  const out  = eseg(time, 0.30, 0.62, "expo");     // a glance away and back
+  const back = eseg(time, 0.98, T.dilate, "expo");
+  const px = mix(mix(0, -26, out), 0, back);
+
+  setCam(cam);
+  fillS(tp(disc(pd), px, 0), "#000");
+  strokeS(tp(disc(rd), px, 0), "#000", EYE.ringW);
+  fillS(tp(disc(EYE.catchD), px + EYE.catchX, EYE.catchY), "#fff");
+  fillS(lowerLid(gap), "#000");
+  fillS(upperLid(gap), "#000");
+}
+
+// the small picture of an eye that every tile carries
+function drawMotif(scale, ink, back, catchD) {
+  const pd = EYE.pupilD * scale, rd = EYE.ringD * scale;
+  if (pd > 0.5) fillS(disc(pd), ink);
+  if (rd > 1) strokeS(disc(rd), ink, EYE.ringW * scale);
+  if (catchD > 0.5) fillS(tp(disc(catchD), EYE.catchX, EYE.catchY), back);
+}
+
+// A thumb: it comes up from the bottom edge, tip leading, and throws upward.
+// Feeds are swiped up, so the tiles have to be seen leaving through the top.
+function drawFinger(u, arrive, ink, back) {
+  let x, y, lean;
+  const lift = FING.restY - TILE.drag;
+  if (u < SW.contact) {                                  // reaching in
+    const app = eseg(u, 0, SW.contact, "smooth");
+    y = mix(FING.enterY, FING.restY, app);
+    x = mix(140, FING.restX, app);
+    lean = mix(-0.20, -0.07, app);
+  } else if (u < SW.release) {                           // the flick
+    const fl = throwEase(seg(u, SW.contact, SW.release));
+    y = mix(FING.restY, lift, fl);
+    x = mix(FING.restX, FING.restX - 34, fl);
+    lean = mix(-0.07, 0.06, fl);
+  } else {                                               // lifting away again
+    const back2 = seg(u, SW.release, 1);
+    y = mix(lift, FING.enterY, back2);
+    x = mix(FING.restX - 34, 140, back2);
+    lean = mix(0.06, -0.20, back2);
+  }
+  y = mix(y, FING.enterY + 240, arrive);                 // the hand withdraws at the end
+  if (y >= FING.enterY) return;                          // off frame
+
+  let P = dome(FING.w, FING.len, FING.w / 2);
+  P = tp(P, 0, FING.len / 2);                            // tip at the origin, body below
+  P = rp(P, lean);                                       // pivots at the tip
+  P = tp(P, x, y);
+  fillS(P, ink);
+  strokeS(P, back, FING.stroke);                         // reads on either polarity
+}
+
+function drawDeck(time, cam) {
+  const s = sAt(time);
+  const i = Math.floor(s), u = s - i;
+  // The last tile is not thrown. It stops being a tile: the tall rounded
+  // rectangle morphs into the circle and stays, as the pupil.
+  // starts only once the throwing has stopped, so it is the last tile that
+  // transforms rather than every tile shrinking on its way out
+  const become = eseg(time, T.decelEnd - 0.20, T.arriveEnd - 0.30, "glide");
+  // the first picture grows out of the black we arrived in
+  const entry = eseg(time, T.swap, T.deck + 0.35, "glide");
+
+  /* --- the tile underneath: flooded, so it covers at any zoom. The letterbox
+         bands above and below are this colour, which is the opposite of the
+         tile on top - that contrast is what makes a tile read as an object. */
+  flood(tileCol(i + 1));
+  setCam(cam);
+  drawMotif(MOTIF * entry * (1 - become), tileInk(i + 1), tileCol(i + 1), 0);
+
+  /* --- the tile on top: thrown upward, or, at the end, becoming the pupil --- */
+  // dragged under the thumb, then flung: it leaves at three times the speed
+  // the hand was moving, which is what makes the release read as a throw.
+  const fl = throwEase(seg(u, SW.contact, SW.release));
+  const flung = seg(u, SW.release, 1);
+  const dy = -(fl * TILE.drag + flung * (TILE.throwDist - TILE.drag));
+  if (dy > -TILE.throwDist * 0.985) {
+    setCam(cam);
+    const spin = fl * TILE.spin;
+    const card = rp(lerpP(rrect(TILE.w, TILE.h, TILE.r), disc(EYE.pupilD), become), spin);
+    fillS(tp(card, 0, dy), tileCol(i));
+    if (become < 1) {                                  // the picture rides the tile
+      ctx.save();
+      trace(tp(card, 0, dy)); ctx.clip();
+      ctx.translate(0, dy); ctx.rotate(spin);
+      drawMotif(MOTIF * entry * (1 - become), tileInk(i), tileCol(i), 0);
+      ctx.restore();
+    }
+  }
+
+  /* --- the thumb --- */
+  setCam(cam);
+  drawFinger(u, become, tileInk(i), tileCol(i));
+
+  /* --- where it touched --- */
+  const rip = seg(u, SW.contact, SW.contact + 0.17);
+  if (rip > 0 && rip < 1 && become < 0.02) {
+    const rr = mix(50, 430, EASE.glide(rip));
+    strokeS(tp(disc(rr), FING.restX, FING.restY), tileInk(i), mix(13, 2, rip));
+  }
+
+  /* --- the eye assembles around the one that stayed --- */
+  setCam(cam);
+  const rd = EYE.ringD * eseg(time, T.decelEnd + 0.35, T.arriveEnd - 0.10, "glide");
+  if (rd > 1) strokeS(disc(rd), "#000", EYE.ringW * (rd / EYE.ringD));
+
+  const cl = EYE.catchD * eseg(time, T.arriveEnd - 0.9, T.arriveEnd + 0.6, "glide");
+  if (cl > 0.5) fillS(tp(disc(cl), EYE.catchX, EYE.catchY), "#fff");
+
+  const sweep = eseg(time, T.decelEnd + 0.25, T.arriveEnd + 0.2, "glide");
+  if (sweep > 0) {
+    fillS(tp(lowerLid(EYE.gap), 0, mix(2600, 0, sweep)), "#000");
+    fillS(tp(upperLid(EYE.gap), 0, mix(-2600, 0, sweep)), "#000");
+  }
+}
+
+/* ---------------- clock ---------------- */
+let playing = true, clock = 0, last = performance.now(), recording = false, recClock = 0;
+const statusEl = document.getElementById("status");
+const saveBtn  = document.getElementById("save");
+const toggleBtn= document.getElementById("toggle");
+const scrub    = document.getElementById("scrub");
+const clockLbl = document.getElementById("clockLabel");
+
+function setStatus(text, on) { statusEl.textContent = text; statusEl.classList.toggle("on", !!on); }
+
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (recording) { recClock += dt; clock = recClock; }
+  else if (playing) { clock = (clock + dt) % DURATION; }
+
+  render(clock);
+  scrub.value = String(Math.round((clock / DURATION) * 1000));
+  clockLbl.textContent = clock.toFixed(1) + "s";
+
+  if (recording) {
+    setStatus("recording... " + Math.min(100, Math.round(recClock / DURATION * 100)) + "%", true);
+    if (recClock >= DURATION - 0.5 / CONFIG.fps) stopRecording();
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ---------------- export ---------------- */
+const MIMES = ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1.42E01E", "video/mp4",
+               "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return null;
+  for (const m of MIMES) if (MediaRecorder.isTypeSupported(m)) return m;
+  return null;
+}
+
+let recorder = null, chunks = [], wasPlaying = true;
+
+function startRecording() {
+  const mime = pickMime();
+  if (!mime) { setStatus("MediaRecorder unsupported in this browser", true); return; }
+  // A hidden tab stops painting, requestAnimationFrame halts, and the capture
+  // stream receives nothing - the recording would just sit at 0%. Say so.
+  if (document.hidden) { setStatus("keep this tab visible to record", true); return; }
+  const stream = canvas.captureStream(CONFIG.fps);
+  try { recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 }); }
+  catch (err) { setStatus("recorder failed: " + err.message, true); return; }
+
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: mime });
+    const ext = mime.indexOf("video/mp4") === 0 ? "mp4" : "webm";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "iris-swipe-1080x1920." + ext;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    setStatus("saved ." + ext + "  " + DURATION.toFixed(1) + "s  " + (blob.size / 1048576).toFixed(1) + " MB", true);
+    saveBtn.disabled = false;
+    playing = wasPlaying;
+    toggleBtn.textContent = playing ? "Pause" : "Play";
+  };
+
+  wasPlaying = playing;
+  saveBtn.disabled = true;
+  recClock = 0; clock = 0; recording = true;
+  render(0);
+  recorder.start(100);
+  setStatus("recording... 0%", true);
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  setStatus("encoding...", true);
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+saveBtn.addEventListener("click", () => { if (!recording) startRecording(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && recording) {
+    recording = false;
+    if (recorder && recorder.state !== "inactive") { recorder.onstop = null; recorder.stop(); }
+    saveBtn.disabled = false;
+    setStatus("recording cancelled — tab was hidden", true);
+  }
+});
+toggleBtn.addEventListener("click", () => {
+  if (recording) return;
+  playing = !playing;
+  toggleBtn.textContent = playing ? "Pause" : "Play";
+});
+scrub.addEventListener("input", () => {
+  if (recording) return;
+  clock = (Number(scrub.value) / 1000) * DURATION;
+  playing = false; toggleBtn.textContent = "Play";
+  render(clock);
+});
+document.addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); toggleBtn.click(); }
+});
+
+setStatus("IRIS / SWIPE  ·  1080 x 1920  ·  " + DURATION.toFixed(1) + "s loop  ·  " + CONFIG.fps + " fps");
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

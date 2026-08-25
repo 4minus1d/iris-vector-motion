@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morph Test — Circle to Rounded Square</title>
+<style>
+  :root { --ink:#fff; --line:#2a2a2a; --dim:#8a8a8a; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #0a0a0a; color: var(--ink);
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; padding: 18px; letter-spacing: .02em;
+  }
+  canvas {
+    display: block; height: min(78vh, 900px); width: auto; aspect-ratio: 9 / 16;
+    background: #000; border: 1px solid var(--line);
+  }
+  .panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  button {
+    font: inherit; color: var(--ink); background: transparent;
+    border: 1px solid var(--line); padding: 8px 14px; cursor: pointer;
+    transition: background .12s ease, color .12s ease, border-color .12s ease;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: #000; border-color: var(--ink); }
+  button:disabled { opacity: .4; cursor: default; }
+  .status { color: var(--dim); min-width: 30ch; }
+  .status.on { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<canvas id="stage" width="1080" height="1920"></canvas>
+
+<div class="panel">
+  <button id="toggle">Pause</button>
+  <button id="save">Save video</button>
+  <span class="status" id="status"></span>
+</div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * config - everything tweakable lives here
+ * ------------------------------------------------------------------ */
+const CONFIG = {
+  W: 1080, H: 1920,          // 9:16 frame
+  fps: 60,
+
+  circleD: 700,              // circle diameter
+  squareSide: 630,           // rounded-square side
+  squareRadius: 126,         // corner radius (20% of side)
+
+  morph: 1.80,               // seconds of travel per transition
+  hold:  0.40,               // seconds parked at each end
+  expo:  10,                 // expo-out strength: higher = harder attack, longer settle
+  quarterTurn: true,         // 90 deg rotation per transition (square is 4-fold symmetric -> seamless)
+
+  bg: "#000", fg: "#fff"
+};
+
+const LOOP = 2 * (CONFIG.morph + CONFIG.hold);   // full cycle: circle -> square -> circle
+
+/* ------------------------------------------------------------------ *
+ * easing - exponential out: max velocity at t=0, asymptotic settle.
+ * Normalised so e(1) === 1 exactly, otherwise each segment ends on a
+ * visible snap of 2^-expo.
+ * ------------------------------------------------------------------ */
+const EXPO_NORM = 1 - Math.pow(2, -CONFIG.expo);
+function expoOut(t) {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return (1 - Math.pow(2, -CONFIG.expo * t)) / EXPO_NORM;
+}
+
+/* ------------------------------------------------------------------ *
+ * geometry - both shapes are the same 8-segment cubic Bezier outline,
+ * so their control points correspond 1:1 and can be lerped directly.
+ * A circle is just this outline with r = side/2 (zero-length edges).
+ * ------------------------------------------------------------------ */
+const KAPPA = 0.5522847498307936;   // circular-arc approximation constant
+
+// Flat point list: [A0, c1,c2,A1, c1,c2,A2, ...] = 1 + 8*3 = 25 points.
+function outline(w, h, r) {
+  const a = w / 2, b = h / 2;
+  r = Math.min(r, a, b);
+  const k = KAPPA * r;
+  const P = [];
+  const push = (x, y) => P.push({ x: x, y: y });
+
+  // a straight run, expressed as a cubic so every segment has the same arity
+  const edge = (x0, y0, x1, y1) => {
+    push(x0 + (x1 - x0) / 3, y0 + (y1 - y0) / 3);
+    push(x0 + (x1 - x0) * 2 / 3, y0 + (y1 - y0) * 2 / 3);
+    push(x1, y1);
+  };
+
+  push(-a + r, -b);                                             // start: end of top-left corner
+  edge(-a + r, -b, a - r, -b);                                  // top edge
+  push(a - r + k, -b); push(a, -b + r - k); push(a, -b + r);    // top-right corner
+  edge(a, -b + r, a, b - r);                                    // right edge
+  push(a, b - r + k); push(a - r + k, b); push(a - r, b);       // bottom-right corner
+  edge(a - r, b, -a + r, b);                                    // bottom edge
+  push(-a + r - k, b); push(-a, b - r + k); push(-a, b - r);    // bottom-left corner
+  edge(-a, b - r, -a, -b + r);                                  // left edge
+  push(-a, -b + r - k); push(-a + r - k, -b); push(-a + r, -b); // top-left corner
+  return P;
+}
+
+const CIRCLE = outline(CONFIG.circleD, CONFIG.circleD, CONFIG.circleD / 2);
+const SQUARE = outline(CONFIG.squareSide, CONFIG.squareSide, CONFIG.squareRadius);
+
+function lerpOutline(A, B, t) {
+  const out = new Array(A.length);
+  for (let i = 0; i < A.length; i++) {
+    out[i] = { x: A[i].x + (B[i].x - A[i].x) * t, y: A[i].y + (B[i].y - A[i].y) * t };
+  }
+  return out;
+}
+
+function tracePath(c, P) {
+  c.beginPath();
+  c.moveTo(P[0].x, P[0].y);
+  for (let i = 1; i < P.length; i += 3) {
+    c.bezierCurveTo(P[i].x, P[i].y, P[i + 1].x, P[i + 1].y, P[i + 2].x, P[i + 2].y);
+  }
+  c.closePath();
+}
+
+/* ------------------------------------------------------------------ *
+ * timeline - a pure function of loop time, so any frame is reproducible
+ * ------------------------------------------------------------------ */
+function stateAt(time) {
+  const u = ((time % LOOP) + LOOP) % LOOP;
+  const M = CONFIG.morph, HOLD = CONFIG.hold;
+  let out, back;                                   // two independent 0->1 ramps
+
+  if (u < M)                 { out = expoOut(u / M);                    back = 0; }
+  else if (u < M + HOLD)     { out = 1;                                 back = 0; }
+  else if (u < 2 * M + HOLD) { out = 1; back = expoOut((u - M - HOLD) / M); }
+  else                       { out = 1;                                 back = 1; }
+
+  return {
+    shape: out - back,                             // 0 = circle, 1 = rounded square
+    rot: CONFIG.quarterTurn ? (out + back) * (Math.PI / 2) : 0
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * render
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+
+function render(time) {
+  const s = stateAt(time);
+  ctx.fillStyle = CONFIG.bg;
+  ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  ctx.save();
+  ctx.translate(CONFIG.W / 2, CONFIG.H / 2);
+  ctx.rotate(s.rot);
+  ctx.fillStyle = CONFIG.fg;
+  tracePath(ctx, lerpOutline(CIRCLE, SQUARE, s.shape));
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ *
+ * clock
+ * ------------------------------------------------------------------ */
+let playing = true;
+let clock = 0;
+let last = performance.now();
+let recording = false;
+let recClock = 0;
+
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  if (recording) { recClock += dt; clock = recClock; }
+  else if (playing) { clock += dt; }
+
+  render(clock);
+
+  if (recording) {
+    const pct = Math.min(100, Math.round((recClock / LOOP) * 100));
+    setStatus("recording... " + pct + "%", true);
+    if (recClock >= LOOP - 0.5 / CONFIG.fps) stopRecording();
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ------------------------------------------------------------------ *
+ * video export - MediaRecorder over canvas.captureStream(), no libs
+ * ------------------------------------------------------------------ */
+const statusEl = document.getElementById("status");
+const saveBtn = document.getElementById("save");
+const toggleBtn = document.getElementById("toggle");
+
+function setStatus(text, on) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("on", !!on);
+}
+
+const MIME_CANDIDATES = [
+  "video/mp4;codecs=avc1.640028",
+  "video/mp4;codecs=avc1.42E01E",
+  "video/mp4",
+  "video/webm;codecs=vp9",
+  "video/webm;codecs=vp8",
+  "video/webm"
+];
+
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return null;
+  for (const m of MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return null;
+}
+
+let recorder = null, chunks = [], wasPlaying = true;
+
+function startRecording() {
+  const mime = pickMime();
+  if (!mime) { setStatus("MediaRecorder unsupported in this browser", true); return; }
+
+  const stream = canvas.captureStream(CONFIG.fps);
+  try {
+    recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 20000000 });
+  } catch (err) {
+    setStatus("recorder failed: " + err.message, true);
+    return;
+  }
+
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: mime });
+    const ext = mime.indexOf("video/mp4") === 0 ? "mp4" : "webm";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "morph-circle-square-1080x1920." + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+    setStatus("saved ." + ext + "  " + LOOP.toFixed(2) + "s  " + (blob.size / 1048576).toFixed(1) + " MB", true);
+    saveBtn.disabled = false;
+    playing = wasPlaying;
+    toggleBtn.textContent = playing ? "Pause" : "Play";
+  };
+
+  wasPlaying = playing;
+  saveBtn.disabled = true;
+  recClock = 0;
+  clock = 0;
+  recording = true;
+  render(0);                 // seed the stream with a clean frame 0
+  recorder.start(100);
+  setStatus("recording... 0%", true);
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  setStatus("encoding...", true);
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+saveBtn.addEventListener("click", () => { if (!recording) startRecording(); });
+
+toggleBtn.addEventListener("click", () => {
+  if (recording) return;
+  playing = !playing;
+  toggleBtn.textContent = playing ? "Pause" : "Play";
+});
+
+document.addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); toggleBtn.click(); }
+});
+
+setStatus(CONFIG.W + " x " + CONFIG.H + "  9:16  " + CONFIG.fps + " fps  loop " + LOOP.toFixed(2) + "s");
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
