@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>it blinks back — 3D</title>
+<style>
+  :root { --ink:#fff; --line:#242424; --dim:#7d7d7d; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #070707; color: var(--ink);
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; letter-spacing: .04em;
+  }
+  canvas {
+    display: block; height: min(80vh, 940px); width: auto; aspect-ratio: 9 / 16;
+    background: #000; border: 1px solid var(--line);
+  }
+  .panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; width: min(92vw, 560px); }
+  button {
+    font: inherit; color: var(--ink); background: transparent;
+    border: 1px solid var(--line); padding: 7px 13px; cursor: pointer;
+    transition: background .12s ease, color .12s ease, border-color .12s ease;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: #000; border-color: var(--ink); }
+  button:disabled { opacity: .35; cursor: default; }
+  input[type=range] { flex: 1 1 180px; accent-color: #fff; height: 2px; background: var(--line); cursor: pointer; }
+  select {
+    font: inherit; color: var(--ink); background: #0e0e0e;
+    border: 1px solid var(--line); padding: 7px 8px; cursor: pointer;
+  }
+  .status { color: var(--dim); width: 100%; text-align: center; }
+  .status.on { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<canvas id="stage" width="1080" height="1920"></canvas>
+
+<div class="panel">
+  <button id="toggle">Pause</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+  <span id="clockLabel">0.0s</span>
+  <select id="speed" title="Playback speed - also applies to the saved file">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="0.75">0.75x</option>
+    <option value="1" selected>1x</option>
+    <option value="1.5">1.5x</option>
+    <option value="2">2x</option>
+    <option value="3">3x</option>
+  </select>
+  <button id="save">Save video</button>
+  <span class="status" id="status">initialising WebGPU...</span>
+</div>
+
+<script type="module">
+"use strict";
+
+/* ==================================================================
+   IT BLINKS BACK — 3D
+   IRIS · no.1 · 1080x1920 · 15s · WebGPU signed distance fields
+
+   The same film, one dimension up. Nothing is a mesh: the whole scene
+   is an implicit surface, raymarched in WGSL.
+
+   Why SDFs and not a path tracer. Every real-time path tracer worth
+   using is a Monte Carlo integrator - it converges stochastically over
+   many samples and leans on temporal reprojection, so frame N depends
+   on frame N-1. This film's contract is the opposite: render(t) must be
+   a pure function of t, and frame 0 must equal frame 900 to the pixel.
+   Raymarched distance fields are analytic and noise-free, so a frame is
+   reproducible from its time alone - and the morph the film is built on
+   is already a distance-field operation:
+
+       2D   lerpP(circle, roundedRect, t)
+       3D   mix(sdCircle2(p), sdRoundRect2(p), t)
+
+   The parallax that had to be hand-built in the 2D version is now just
+   perspective, and comes out of the projection for free.
+   ================================================================== */
+
+const CONFIG = { W: 1080, H: 1920, fps: 60 };
+const W = CONFIG.W, H = CONFIG.H;
+
+/* ---------------- timeline: identical to the 2D cut ---------------- */
+const T = {
+  blinkShut:  0.72,
+  blinkOpen:  0.92,
+  dilate:     1.24,
+  push:       1.90,
+  swap:       2.30,   // through the pupil, in darkness
+  corridor:   2.55,
+  accelEnd:   9.30,
+  decelEnd:  10.65,
+  arrive:     9.60,
+  arriveEnd: 12.00,
+  end:       15.00
+};
+const DURATION = T.end;
+
+/* ---------------- easing ---------------- */
+const EXPO = 10, EXPO_NORM = 1 - Math.pow(2, -EXPO);
+const EASE = {
+  expo:   t => t <= 0 ? 0 : t >= 1 ? 1 : (1 - Math.pow(2, -EXPO * t)) / EXPO_NORM,
+  glide:  t => t <= 0 ? 0 : t >= 1 ? 1 : 1 - Math.pow(1 - t, 4),
+  smooth: t => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t)
+};
+const mix = (a, b, t) => t >= 1 ? b : t <= 0 ? a : a + (b - a) * t;
+const clamp01 = t => t < 0 ? 0 : t > 1 ? 1 : t;
+function seg(time, t0, t1) { return t1 <= t0 ? (time >= t1 ? 1 : 0) : clamp01((time - t0) / (t1 - t0)); }
+function eseg(time, t0, t1, e) { return EASE[e || "expo"](seg(time, t0, t1)); }
+
+/* ---------------- camera ----------------
+   Same rig as the 2D film: one closed Hermite spline, finite-difference
+   tangents in real time, so velocity is continuous across every key and
+   across the loop seam. z is now a real distance rather than a zoom, and
+   is splined in log space for the same reason zoom was - constant
+   perceived rate across a 40x range.
+
+   The world travels, not the camera. Portals stream toward the lens
+   while the camera holds a small expressive move, which is what lets the
+   loop close: at t=DURATION the camera is exactly where it began.      */
+const CAM = [
+  { t:  0.00, x:  0.00, y:  0.00, z: 3.05, r:  0.000 },   // the frame you stop on
+  { t:  0.85, x: -0.10, y: -0.05, z: 2.55, r:  0.045 },
+  { t:  1.70, x: -0.16, y:  0.07, z: 1.55, r:  0.100 },
+  { t:  2.05, x: -0.05, y:  0.03, z: 0.55, r:  0.060 },   // diving
+  { t:  2.30, x:  0.00, y:  0.00, z: 0.075, r: 0.000 },   // inside the pupil, black
+  { t:  2.55, x:  0.00, y:  0.00, z: 0.62, r: -0.030 },
+  { t:  2.90, x:  0.16, y: -0.12, z: 0.78, r: -0.055 },
+  { t:  3.90, x:  0.62, y: -0.38, z: 0.82, r: -0.028 },
+  { t:  5.00, x: -0.44, y:  0.56, z: 0.86, r:  0.040 },
+  { t:  6.10, x:  0.70, y:  0.46, z: 0.90, r:  0.062 },
+  { t:  7.20, x: -0.66, y: -0.40, z: 0.94, r:  0.022 },
+  { t:  8.30, x:  0.50, y: -0.60, z: 0.98, r: -0.042 },
+  { t:  9.40, x: -0.42, y:  0.30, z: 1.06, r: -0.064 },
+  { t: 10.50, x:  0.18, y:  0.22, z: 1.35, r: -0.026 },
+  { t: 11.40, x:  0.12, y: -0.05, z: 2.30, r:  0.030 },   // widest, inside the lid sweep
+  { t: 12.60, x: -0.08, y:  0.07, z: 2.80, r:  0.078 },
+  { t: 13.70, x:  0.10, y:  0.05, z: 2.96, r:  0.044 }
+];
+const CAM_K = CAM.map(k => ({ t: k.t, v: [k.x, k.y, Math.log(k.z), k.r] }));
+const CAM_D = CAM_K.map((k, i) => {
+  const d = CAM_K[(i + 1) % CAM_K.length].t - k.t;
+  return d > 0 ? d : d + DURATION;
+});
+const CAM_M = CAM_K.map((k, i) => {
+  const n = CAM_K.length;
+  const prev = CAM_K[(i - 1 + n) % n].v, next = CAM_K[(i + 1) % n].v;
+  const span = CAM_D[(i - 1 + n) % n] + CAM_D[i];
+  return next.map((v, c) => (v - prev[c]) / span);
+});
+function sampleCam(time) {
+  const n = CAM_K.length;
+  const t = ((time % DURATION) + DURATION) % DURATION;
+  let i = n - 1;
+  for (let k = 0; k < n; k++) { if (t >= CAM_K[k].t) i = k; else break; }
+  const j = (i + 1) % n, d = CAM_D[i];
+  const u = clamp01((t - CAM_K[i].t) / d);
+  const u2 = u * u, u3 = u2 * u;
+  const h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u, h01 = -2*u3 + 3*u2, h11 = u3 - u2;
+  const o = [0, 0, 0, 0];
+  for (let c = 0; c < 4; c++) {
+    o[c] = h00 * CAM_K[i].v[c] + h10 * d * CAM_M[i][c]
+         + h01 * CAM_K[j].v[c] + h11 * d * CAM_M[j][c];
+  }
+  return { x: o[0], y: o[1], z: Math.exp(o[2]), r: o[3] };
+}
+
+/* ---------------- travel ----------------
+   Screens passed, as a velocity profile: deliberate, accelerating to
+   frantic, then decaying to rest. Same numbers as the 2D cut, so the
+   two films share a rhythm. v1 is tuned so the floor lands odd, which
+   sets the closing polarity.                                          */
+/* v1 is chosen so floor(Q_END) is EVEN. Palette swaps on every threshold, so
+   the parity of the screens passed decides which world you end in - and the
+   loop only closes if that is the world you started in. In the 2D cut the
+   same number was tuned for the opposite parity, because there it decided
+   whether the closing field was white. */
+const Q = { v0: 0.75, v1: 4.50 };
+const Q_U = T.accelEnd - T.corridor, Q_TAU = T.decelEnd - T.accelEnd;
+const Q_A = Q.v0 * Q_U + (Q.v1 - Q.v0) * Q_U / 3;
+const Q_END = Q_A + Q.v1 * Q_TAU * 0.5;
+function qAt(time) {
+  if (time <= T.corridor) return 0;
+  if (time <= T.accelEnd) {
+    const u = time - T.corridor;
+    return Q.v0 * u + (Q.v1 - Q.v0) * u * u * u / (3 * Q_U * Q_U);
+  }
+  if (time >= T.decelEnd) return Q_END;
+  const s = (time - T.accelEnd) / Q_TAU;
+  return Q_A + Q.v1 * Q_TAU * (s / 2 + Math.sin(Math.PI * s) / (2 * Math.PI));
+}
+
+/* ---------------- the shader ---------------- */
+const WGSL = /* wgsl */`
+struct U {
+  a   : vec4f,   // res.xy, mode, dark
+  cam : vec4f,   // camPos.xyz, roll
+  eye : vec4f,   // lidTop, lidBot, pupilR, irisR
+  cor : vec4f,   // travel, spacing, morphNear, morphFar
+  msc : vec4f,   // steps, become, eyeOn, corOn
+  pLo : vec4f,   // horizon colour, .w = vignette
+  pHi : vec4f,   // sky colour,     .w = key sharpness
+  pKey: vec4f,   // key colour,     .w = dispersion
+};
+@group(0) @binding(0) var<uniform> u : U;
+
+const PI = 3.14159265359;
+
+/* The environment is procedural - a direction-keyed gradient with a single
+   warm key. Nothing is sampled from a texture, so the whole render stays a
+   pure function of the uniforms, which is what keeps the loop exact. It is
+   also the only light in the scene: the glass gets its colour from it. */
+fn env(d: vec3f) -> vec3f {
+  let t = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+  var c = mix(u.pLo.rgb, u.pHi.rgb, t * t * (3.0 - 2.0 * t));
+  let key = pow(clamp(dot(normalize(d), normalize(vec3f(0.35, 0.55, 0.75))), 0.0, 1.0), u.pHi.w);
+  c = c + u.pKey.rgb * key * 1.15;
+  let rim = pow(clamp(1.0 - abs(d.y), 0.0, 1.0), 6.0);
+  c = c + u.pKey.rgb * rim * 0.10;
+  return c;
+}
+
+fn sdSphere(p: vec3f, r: f32) -> f32 { return length(p) - r; }
+
+fn sdCircle2(p: vec2f, r: f32) -> f32 { return length(p) - r; }
+
+fn sdRoundRect2(p: vec2f, b: vec2f, r: f32) -> f32 {
+  let q = abs(p) - b + vec2f(r);
+  return length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// extrude a 2D field along z with half-thickness h
+fn opExtrude(d2: f32, z: f32, h: f32) -> f32 {
+  let w = vec2f(d2, abs(z) - h);
+  return min(max(w.x, w.y), 0.0) + length(max(w, vec2f(0.0)));
+}
+
+fn sdTorusZ(p: vec3f, R: f32, r: f32) -> f32 {
+  let q = vec2f(length(p.xy) - R, p.z);
+  return length(q) - r;
+}
+
+// The film's one morph, as a distance field: a circle becoming a 9:16
+// rounded rectangle. Mixing the two fields is the direct analogue of
+// lerping the 25 control points in the 2D version.
+fn holeField(p: vec2f, s: f32, m: f32) -> f32 {
+  let c = sdCircle2(p, s * 0.5);
+  let h = s * 0.62;
+  let w = h * 0.5625;
+  let r = sdRoundRect2(p, vec2f(w, h), w * 0.26);
+  return mix(c, r, m);
+}
+
+fn opU(a: vec2f, b: vec2f) -> vec2f { if (a.x < b.x) { return a; } return b; }
+
+/* --- the eye ---
+   A sclera sphere with the pupil bored clean through, so the dive is a
+   real passage rather than a dissolve; a proud iris ring; and two lids
+   that are shells of a slightly larger sphere cut by a moving plane, so
+   a blink slides shut across the eyeball instead of scaling.          */
+fn eyeScene(p: vec3f) -> vec2f {
+  let R = 1.0;
+  var res = vec2f(sdSphere(p, R), 1.0);          // 1 = glass
+
+  /* The pupil is a dark body, not an opening. Boring a hole was the obvious
+     move and it was wrong: the ray exits into the environment and the pupil
+     comes back as the brightest thing in frame, when the whole composition
+     depends on it being the darkest. The dive still works - the blackout
+     carries the passage, exactly as the 2D cut did. */
+  let pupil = opExtrude(sdCircle2(p.xy, u.eye.z), p.z - 0.62, 0.55);
+  res = opU(res, vec2f(pupil, 2.0));
+
+  let ring = sdTorusZ(p - vec3f(0.0, 0.0, sqrt(max(R*R - u.eye.w*u.eye.w, 0.0)) - 0.02),
+                      u.eye.w, 0.030);
+  res = opU(res, vec2f(ring, 2.0));              // 2 = ink
+
+  let shell = max(sdSphere(p, R + 0.055), -sdSphere(p, R + 0.005));
+  let upper = max(shell, u.eye.x - p.y);
+  let lower = max(shell, p.y - u.eye.y);
+  res = opU(res, vec2f(min(upper, lower), 2.0));
+  return res;
+}
+
+/* --- the corridor ---
+   Screens on a regular grid in z, streaming toward the lens. Only the
+   three nearest to the sample point are evaluated: they are separated
+   along the ray's dominant axis, so the rest cannot be the minimum and
+   testing them is wasted work.                                        */
+fn corridorScene(p: vec3f) -> vec2f {
+  var res = vec2f(1e9, 0.0);
+  let sp = u.cor.y;
+  let s  = 2.6;
+  let k = round((p.z + u.cor.x) / sp);
+  for (var j = -1; j <= 1; j = j + 1) {
+    let idx = k + f32(j);
+    let zc = idx * sp - u.cor.x;
+    // how far ahead of the lens this screen is, measured in screens. Far ones
+    // are still circles; by the time one reaches you it is a 9:16 screen.
+    let rel = (u.cam.z - zc) / sp;
+    // Only a few screens exist at once. Marching the whole tunnel stacked a
+    // dozen holes into concentric rings - legible as a pattern, useless as
+    // depth. Four big ones read; twelve small ones are wallpaper.
+    if (rel > 4.4 || rel < -1.0) { continue; }
+    let m = clamp((rel - u.cor.z) / (u.cor.w - u.cor.z), 0.0, 1.0);
+    let q = vec3f(p.xy, p.z - zc);
+    let hole = holeField(q.xy, s, 1.0 - m);
+    let outer = sdRoundRect2(q.xy, vec2f(s * 0.95, s * 1.55), s * 0.34);
+    let frame = opExtrude(max(outer, -hole), q.z, 0.22);
+    res = opU(res, vec2f(frame, 3.0));               // 3 = screen
+  }
+  return res;
+}
+
+fn scene(p: vec3f) -> vec2f {
+  var res = vec2f(1e9, 0.0);
+  // msc.z is the eye's scale, not a flag: at the close it grows into place
+  // around the last screen rather than appearing whole on one frame
+  let sc = u.msc.z;
+  if (sc > 0.001) {
+    let e = eyeScene(p / sc);
+    res = opU(res, vec2f(e.x * sc, e.y));
+  }
+  if (u.msc.w > 0.5) { res = opU(res, corridorScene(p)); }
+  return res;
+}
+
+fn normalAt(p: vec3f) -> vec3f {
+  let e = vec2f(1.0, -1.0) * 0.0015;
+  return normalize(
+      e.xyy * scene(p + e.xyy).x + e.yyx * scene(p + e.yyx).x
+    + e.yxy * scene(p + e.yxy).x + e.xxx * scene(p + e.xxx).x);
+}
+
+fn ao(p: vec3f, n: vec3f) -> f32 {
+  var occ = 0.0; var sca = 1.0;
+  for (var i = 0; i < 5; i = i + 1) {
+    let h = 0.012 + 0.11 * f32(i) / 4.0;
+    occ = occ + (h - scene(p + n * h).x) * sca;
+    sca = sca * 0.82;
+  }
+  return clamp(1.0 - 1.6 * occ, 0.0, 1.0);
+}
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var v = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
+  return vec4f(v[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let res = u.a.xy;
+  var uv = (frag.xy - 0.5 * res) / res.y;
+  uv.y = -uv.y;
+
+  let ca = cos(u.cam.w); let sa = sin(u.cam.w);
+  uv = vec2f(uv.x * ca - uv.y * sa, uv.x * sa + uv.y * ca);
+
+  let ro = u.cam.xyz;
+  let rd = normalize(vec3f(uv, -1.25));           // fixed lens; distance does the work
+
+  var t = 0.0;
+  var hit = vec2f(-1.0, 0.0);
+  let steps = i32(u.msc.x);
+  for (var i = 0; i < steps; i = i + 1) {
+    let p = ro + rd * t;
+    let h = scene(p);
+    if (h.x < 0.0006 * t + 0.0006) { hit = vec2f(t, h.y); break; }
+    t = t + h.x * 0.85;
+    if (t > 17.0) { break; }
+  }
+
+  var col = env(rd);                                  // the miss case is the backdrop
+
+  if (hit.x > 0.0) {
+    let p = ro + rd * hit.x;
+    let n = normalAt(p);
+    let occ = ao(p, n);
+
+    // Schlick, biased bright: glass is mostly rim, and the rim is where the
+    // gradient shows, so this is what carries the colour.
+    let cosTheta = clamp(dot(-rd, n), 0.0, 1.0);
+    let fres = 0.06 + 0.94 * pow(1.0 - cosTheta, 4.0);
+
+    let refl = env(reflect(rd, n));
+
+    // One-surface refraction with a per-channel IOR. Real dispersion needs the
+    // exit interface too; sampling the environment three times is the cheap
+    // version and it is what reads as glass at this scale.
+    let disp = u.pKey.w;
+    let rr = refract(rd, n, 1.0 / (1.44 - disp));
+    let rg = refract(rd, n, 1.0 / 1.44);
+    let rb = refract(rd, n, 1.0 / (1.44 + disp));
+    let refr = vec3f(env(rr).r, env(rg).g, env(rb).b);
+
+    let h = normalize(-rd + normalize(vec3f(0.35, 0.55, 0.75)));
+    let spec = pow(clamp(dot(n, h), 0.0, 1.0), 120.0);
+    // the edge is where glass announces itself: a hot rim in the key colour
+    let rim = pow(1.0 - cosTheta, 3.0);
+
+    if (hit.y < 1.5) {
+      col = mix(refr * 0.60, refl, fres) * mix(0.40, 1.0, occ)
+          + u.pKey.rgb * rim * 0.55 + spec * 2.2;
+    } else if (hit.y < 2.5) {
+      // smoked glass: nearly opaque, alive only at the rim and the highlight
+      col = mix(u.pLo.rgb * 0.5, refl, fres * 0.75) * mix(0.30, 1.0, occ)
+          + u.pKey.rgb * rim * 0.28 + spec * 1.1;
+    } else {
+      // the screens: frosted and tinted, with a bright edge so the corridor
+      // reads as a receding stack rather than dissolving into the backdrop
+      col = mix(u.pLo.rgb * 4.5, refl, fres * 0.75) * mix(0.30, 1.0, occ)
+          + u.pKey.rgb * rim * 0.95 + spec * 1.6;
+    }
+  }
+
+  // depth haze: the far end of the corridor dissolves into the environment
+  // rather than ending on a hard cull
+  if (hit.x > 0.0) { col = mix(col, env(rd), smoothstep(4.5, 14.0, hit.x)); }
+
+  // vignette, then the blackout that hides the passage through the pupil
+  let vuv = (frag.xy - 0.5 * res) / res.y;
+  col = col * (1.0 - u.pLo.w * dot(vuv, vuv) * 0.9);
+  col = col * u.a.w;
+
+  col = max(col, vec3f(0.0)) * 1.35;
+  col = col / (col + vec3f(1.0));                     // Reinhard, then sRGB
+  col = pow(col, vec3f(1.0 / 2.2));
+  return vec4f(col, 1.0);
+}
+`;
+
+/* ---------------- WebGPU ---------------- */
+const canvas = document.getElementById("stage");
+const statusEl = document.getElementById("status");
+function setStatus(text, on) { statusEl.textContent = text; statusEl.classList.toggle("on", !!on); }
+
+let device = null, ctx = null, pipeline = null, uniformBuf = null, bindGroup = null, format = null;
+const UNIFORM_FLOATS = 32;                       // 8 x vec4f
+const uniformData = new Float32Array(UNIFORM_FLOATS);
+
+async function initGPU() {
+  if (!navigator.gpu) throw new Error("WebGPU not available in this browser");
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new Error("no WebGPU adapter");
+  device = await adapter.requestDevice();
+  device.lost.then(info => setStatus("GPU device lost: " + info.message, true));
+
+  ctx = canvas.getContext("webgpu");
+  format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: "opaque" });
+
+  const module = device.createShaderModule({ code: WGSL });
+  const info = await module.getCompilationInfo();
+  const errs = info.messages.filter(m => m.type === "error");
+  if (errs.length) throw new Error("WGSL: " + errs.map(m => `${m.lineNum}:${m.linePos} ${m.message}`).join(" | "));
+
+  pipeline = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module, entryPoint: "vs" },
+    fragment: { module, entryPoint: "fs", targets: [{ format }] },
+    primitive: { topology: "triangle-list" }
+  });
+  uniformBuf = device.createBuffer({
+    size: UNIFORM_FLOATS * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuf } }]
+  });
+}
+
+/* ---------------- the film, as uniforms ----------------
+   All timeline logic stays in JS, where it can be read back and
+   verified frame by frame. The shader is a pure function of this
+   struct, so a frame is reproducible from its time alone.            */
+const EYE = { pupilR: 0.150, irisR: 0.290, lidOpen: 0.560 };
+const CORR = { spacing: 3.20, morphNear: 0.30, morphFar: 2.60 };
+
+/* Two palettes. In the 2D film every threshold flipped black to white; here
+   it swaps the whole environment cool-to-warm. Same beat, same cause - the
+   passage through a screen - translated into colour. */
+const PALETTE = [
+  { lo: [0.005, 0.008, 0.030], hi: [0.020, 0.075, 0.165], key: [1.95, 0.40, 1.60] },
+  { lo: [0.030, 0.007, 0.018], hi: [0.150, 0.055, 0.028], key: [0.32, 1.20, 2.00] }
+];
+// The environment carries real range - almost black at the floor, well above 1
+// at the key. Glass has nothing to show if the world it reflects is flat.
+const LOOK = { vignette: 0.90, keySharp: 26.0, dispersion: 0.060 };
+
+function uniformsFor(time, steps) {
+  const cam = sampleCam(time);
+  const inEye = time < T.swap;
+
+  // blink, then the pupil widening into the dive
+  const shut = eseg(time, T.blinkShut - 0.22, T.blinkShut, "expo");
+  const open = eseg(time, T.blinkShut, T.blinkOpen, "expo");
+  const lidT = mix(mix(EYE.lidOpen, 0.012, shut), EYE.lidOpen, open);
+  const dil  = eseg(time, T.dilate, T.push, "expo");
+
+  // the closing: the last screen stops being a screen and becomes the pupil
+  const become = eseg(time, T.decelEnd - 0.20, T.arriveEnd - 0.30, "glide");
+  const sweep  = eseg(time, T.decelEnd + 0.25, T.arriveEnd + 0.20, "glide");
+
+  const q = qAt(time);
+  const travel = q * CORR.spacing;
+  // every threshold turns the world over: the swaps are the passages
+  const pal = PALETTE[((Math.floor(q) % 2) + 2) % 2];
+
+  /* The act change happens inside the pupil, and it has to be invisible.
+     In the 2D cut the pupil simply filled the frame; here the camera is
+     physically inside a narrow bore, so darkness is earned - but the swap
+     is too important to leave to occlusion, so it is also driven. */
+  const dark = 1 - clamp01(Math.min(seg(time, 2.00, 2.26), 1 - seg(time, 2.34, 2.62)));
+
+  const eyeOn = inEye ? 1 : (become > 0.001 ? mix(0.06, 1, become) : 0);
+  const corOn = (!inEye && become < 0.999) ? 1 : 0;
+
+  const lidNow = inEye ? lidT : mix(EYE.lidOpen * 1.9, EYE.lidOpen, sweep) * (sweep > 0 ? 1 : 1);
+  const lidTop = inEye ? lidT : mix(2.2, EYE.lidOpen, sweep);
+  const lidBot = -lidTop;
+  const pupilR = inEye ? mix(EYE.pupilR, EYE.pupilR * 1.22, dil)
+                       : mix(0.0001, EYE.pupilR, become);
+  const irisR  = inEye ? mix(EYE.irisR, EYE.irisR * 1.10, dil)
+                       : mix(0.0001, EYE.irisR, become);
+
+  const d = uniformData;
+  d[0]  = W;         d[1]  = H;            d[2]  = inEye ? 0 : 1;   d[3]  = dark;
+  d[4]  = cam.x;     d[5]  = cam.y;        d[6]  = cam.z;           d[7]  = cam.r;
+  d[8]  = lidTop;    d[9]  = lidBot;       d[10] = pupilR;          d[11] = irisR;
+  d[12] = travel;    d[13] = CORR.spacing; d[14] = CORR.morphNear;  d[15] = CORR.morphFar;
+  d[16] = steps;     d[17] = become;       d[18] = eyeOn;           d[19] = corOn;
+  d[20] = pal.lo[0]; d[21] = pal.lo[1];    d[22] = pal.lo[2];       d[23] = LOOK.vignette;
+  d[24] = pal.hi[0]; d[25] = pal.hi[1];    d[26] = pal.hi[2];       d[27] = LOOK.keySharp;
+  d[28] = pal.key[0];d[29] = pal.key[1];   d[30] = pal.key[2];      d[31] = LOOK.dispersion;
+  return d;
+}
+
+function render(time, steps) {
+  if (!device) return;
+  device.queue.writeBuffer(uniformBuf, 0, uniformsFor(time, steps || QUALITY.preview));
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: "clear", storeOp: "store"
+    }]
+  });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+const QUALITY = { preview: 96, export: 190 };
+
+/* ---------------- clock ---------------- */
+let playing = true, clock = 0, last = performance.now(), exporting = false;
+let speed = 1;
+const saveBtn = document.getElementById("save");
+const toggleBtn = document.getElementById("toggle");
+const scrub = document.getElementById("scrub");
+const speedSel = document.getElementById("speed");
+const clockLbl = document.getElementById("clockLabel");
+
+function updateUI() {
+  scrub.value = String(Math.round((clock / DURATION) * 1000));
+  clockLbl.textContent = clock.toFixed(1) + "s";
+}
+function tick(now) {
+  requestAnimationFrame(tick);
+  if (exporting) return;
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (playing) clock = (clock + dt * speed) % DURATION;
+  render(clock);
+  updateUI();
+}
+
+/* ---------------- export: offline, same muxer as the 2D films ------ */
+const MP4 = {
+  u8:  a => new Uint8Array(a),
+  u16: n => new Uint8Array([n >> 8 & 255, n & 255]),
+  u32: n => new Uint8Array([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]),
+  str: s => { const o = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) o[i] = s.charCodeAt(i); return o; },
+  cat: a => { let n = 0; for (const x of a) n += x.length; const o = new Uint8Array(n); let p = 0;
+              for (const x of a) { o.set(x, p); p += x.length; } return o; }
+};
+const box  = (type, ...parts) => { const b = MP4.cat(parts); return MP4.cat([MP4.u32(b.length + 8), MP4.str(type), b]); };
+const fbox = (type, ver, flags, ...parts) => box(type, MP4.u8([ver, flags >> 16 & 255, flags >> 8 & 255, flags & 255]), ...parts);
+const MATRIX = MP4.cat([0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000].map(MP4.u32));
+
+function muxMP4(samples, syncs, avcc, w, h, fps) {
+  const { u8, u16, u32, str, cat } = MP4;
+  const N = samples.length, TS = fps * 1000, DELTA = 1000, MTS = 1000;
+  const movieDur = Math.round(N / fps * MTS), mediaDur = N * DELTA;
+  const stsd = fbox("stsd", 0, 0, u32(1),
+    box("avc1", u8(new Array(6).fill(0)), u16(1), u16(0), u16(0), u32(0), u32(0), u32(0),
+      u16(w), u16(h), u32(0x00480000), u32(0x00480000), u32(0), u16(1),
+      u8(new Array(32).fill(0)), u16(0x0018), u8([0xff, 0xff]), box("avcC", avcc)));
+  const stts = fbox("stts", 0, 0, u32(1), u32(N), u32(DELTA));
+  const stss = fbox("stss", 0, 0, u32(syncs.length), ...syncs.map(u32));
+  const stsc = fbox("stsc", 0, 0, u32(1), u32(1), u32(N), u32(1));
+  const stsz = fbox("stsz", 0, 0, u32(0), u32(N), ...samples.map(s => u32(s.length)));
+  const build = dataStart => box("moov",
+    fbox("mvhd", 0, 0, u32(0), u32(0), u32(MTS), u32(movieDur), u32(0x00010000),
+         u16(0x0100), u8(new Array(10).fill(0)), MATRIX, u8(new Array(24).fill(0)), u32(2)),
+    box("trak",
+      fbox("tkhd", 0, 3, u32(0), u32(0), u32(1), u32(0), u32(movieDur),
+           u8(new Array(8).fill(0)), u16(0), u16(0), u16(0), u16(0), MATRIX,
+           u32(w * 65536), u32(h * 65536)),
+      box("mdia",
+        fbox("mdhd", 0, 0, u32(0), u32(0), u32(TS), u32(mediaDur), u16(0x55C4), u16(0)),
+        fbox("hdlr", 0, 0, u32(0), str("vide"), u8(new Array(12).fill(0)), str("VideoHandler\0")),
+        box("minf",
+          fbox("vmhd", 0, 1, u16(0), u16(0), u16(0), u16(0)),
+          box("dinf", fbox("dref", 0, 0, u32(1), fbox("url ", 0, 1))),
+          box("stbl", stsd, stts, stss, stsc, stsz,
+              fbox("stco", 0, 0, u32(1), u32(dataStart)))))));
+  const ftyp = box("ftyp", str("isom"), u32(512), str("isom"), str("iso2"), str("avc1"), str("mp41"));
+  const moov = build(ftyp.length + build(0).length + 8);
+  let total = 0; for (const s of samples) total += s.length;
+  return cat([ftyp, moov, cat([u32(total + 8), str("mdat"), ...samples])]);
+}
+
+const CODECS = ["avc1.640034", "avc1.640033", "avc1.64002a", "avc1.640028"];
+const yieldNow = () => new Promise(r => {
+  const ch = new MessageChannel(); ch.port1.onmessage = () => r(); ch.port2.postMessage(0);
+});
+async function encoderConfig() {
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") return null;
+  for (const codec of CODECS) {
+    const cfg = { codec, width: W, height: H, bitrate: 20000000, framerate: CONFIG.fps, avc: { format: "avc" } };
+    try { const s = await VideoEncoder.isConfigSupported(cfg); if (s && s.supported) return cfg; } catch (e) {}
+  }
+  return null;
+}
+
+async function exportFilm() {
+  if (exporting || !device) return;
+  const cfg = await encoderConfig();
+  if (!cfg) { setStatus("WebCodecs unavailable — cannot export", true); return; }
+  exporting = true; saveBtn.disabled = true; speedSel.disabled = true;
+  const wasPlaying = playing; playing = false;
+
+  const samples = [], syncs = [];
+  let avcc = null, failed = null, lastTs = -1, ordered = true;
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && meta.decoderConfig.description && !avcc)
+        avcc = new Uint8Array(meta.decoderConfig.description);
+      if (chunk.timestamp <= lastTs) ordered = false;
+      lastTs = chunk.timestamp;
+      const d = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(d);
+      if (chunk.type === "key") syncs.push(samples.length + 1);
+      samples.push(d);
+    },
+    error: e => { failed = e.message; }
+  });
+  enc.configure(cfg);
+
+  const outFrames = Math.round(DURATION * CONFIG.fps / speed);
+  const us = 1e6 / CONFIG.fps;
+  for (let n = 0; n < outFrames && !failed; n++) {
+    clock = n * speed / CONFIG.fps;
+    render(clock, QUALITY.export);
+    // the canvas is only safe to snapshot once the GPU has finished with it
+    await device.queue.onSubmittedWorkDone();
+    const frame = new VideoFrame(canvas, { timestamp: Math.round(n * us), duration: Math.round(us) });
+    enc.encode(frame, { keyFrame: n % CONFIG.fps === 0 });
+    frame.close();
+    while (enc.encodeQueueSize > 6 && !failed) await yieldNow();
+    if (n % 10 === 0) {
+      setStatus("rendering " + Math.round((n + 1) / outFrames * 100) + "%", true);
+      await yieldNow();
+    }
+  }
+  try { await enc.flush(); } catch (e) { failed = failed || e.message; }
+  try { enc.close(); } catch (e) {}
+
+  const restore = () => { exporting = false; saveBtn.disabled = false; speedSel.disabled = false;
+                          last = performance.now(); playing = wasPlaying;
+                          toggleBtn.textContent = playing ? "Pause" : "Play"; };
+  if (failed || !avcc || !ordered || samples.length !== outFrames) {
+    setStatus(failed ? "encoder error: " + failed
+              : !ordered ? "encoder reordered frames — aborted"
+              : "encode incomplete — aborted", true);
+    restore(); return;
+  }
+  setStatus("writing mp4...", true);
+  await yieldNow();
+  const blob = new Blob([muxMP4(samples, syncs, avcc, W, H, CONFIG.fps)], { type: "video/mp4" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "iris3d-1080x1920" + (speed === 1 ? "" : "-" + speed + "x") + ".mp4";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  setStatus("saved .mp4  " + outFrames + " frames  " + (DURATION / speed).toFixed(1) + "s  "
+            + (blob.size / 1048576).toFixed(1) + " MB", true);
+  restore();
+}
+
+/* ---------------- wiring ---------------- */
+saveBtn.addEventListener("click", exportFilm);
+toggleBtn.addEventListener("click", () => {
+  if (exporting) return;
+  playing = !playing;
+  toggleBtn.textContent = playing ? "Pause" : "Play";
+});
+speedSel.addEventListener("change", () => { speed = Number(speedSel.value) || 1; });
+scrub.addEventListener("input", () => {
+  if (exporting) return;
+  clock = (Number(scrub.value) / 1000) * DURATION;
+  playing = false; toggleBtn.textContent = "Play";
+  render(clock);
+});
+document.addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); toggleBtn.click(); }
+});
+
+initGPU().then(() => {
+  setStatus("IRIS 3D  ·  1080 x 1920  ·  " + DURATION.toFixed(1) + "s loop  ·  SDF raymarch");
+  window.__ready = true;
+  requestAnimationFrame(tick);
+}).catch(err => {
+  setStatus(err.message, true);
+  window.__ready = false; window.__err = err.message;
+});
+
+// exposed for the verification harness
+window.IRIS3D = { render, sampleCam, qAt, uniformsFor, get clock() { return clock; },
+                  set clock(v) { clock = v; }, get playing() { return playing; },
+                  set playing(v) { playing = v; }, DURATION, T, QUALITY, canvas };
+</script>
+</body>
+</html>

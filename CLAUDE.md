@@ -12,6 +12,7 @@ generator, one camera rig, one canvas, one exporter, all hand-written.
 |---|---|
 | `iris.html` — *it blinks back* | Eye → dive → corridor of screens → eye |
 | `iris-swipe.html` | Eye → dive → deck of tiles thrown upward by a thumb → eye |
+| `iris3d.html` | The same film in 3D: WebGPU SDF raymarch, glass and gradients |
 | `index.html` | The original circle → rounded-square morph test |
 | `server.mjs` | Zero-dependency static server, local dev only |
 
@@ -203,6 +204,38 @@ does not tile `[0, DURATION)` and the loop seam drifts. Verified at 2×:
 450 frames, decoded `duration 7.5`.
 
 ---
+
+## The 3D film (`iris3d.html`)
+
+Same timeline, same camera rig, same export. The renderer is a **WGSL SDF
+raymarcher on WebGPU** — no meshes, no BVH, no libraries.
+
+**Do not swap it for a path tracer.** Every real-time path tracer worth using
+is a Monte Carlo integrator that converges over many samples and relies on
+temporal reprojection, so frame N depends on frame N−1. That breaks both hard
+invariants at once: `render(t)` stops being pure, and the loop stops being
+exact. Denoising also destroys the hard edges the piece depends on.
+
+Rules specific to it:
+
+- **The pupil is a dark body, not a hole.** Boring through was tried: the ray
+  exits into the environment and the pupil comes back as the *brightest* thing
+  in frame, when the composition needs it to be the darkest. The blackout
+  carries the dive, exactly as in 2D.
+- **`msc.z` is the eye's scale, not a flag** — the eye grows into place at the
+  close instead of appearing whole on one frame.
+- **Cull the corridor to ~4 screens.** Marching the full tunnel stacks a dozen
+  holes into concentric rings: legible as a pattern, useless as depth. Depth
+  haze hides the cull.
+- **The travel constant sets the closing palette.** `Q.v1` is tuned so
+  `floor(Q_END)` is **even**, because the palette swaps on every threshold and
+  the loop only closes if you end in the world you started in. The 2D films
+  tune the same number for the opposite parity.
+- Keep the camera well off-axis through the corridor — near screens must
+  displace more than far ones, or it reads as concentric rings again.
+
+Verify with the same protocol: uniforms and pixels identical at `t = 0` and
+`t = DURATION` (currently 0 differing pixels), luminance 0 at the act swap.
 
 ## Conventions
 
