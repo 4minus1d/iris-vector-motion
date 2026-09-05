@@ -1,44 +1,16 @@
-# IRIS
+Vector Motion Using Pure Code:
 
-Two 9:16 black-and-white film loops, built as pure vector animation on a canvas.
-No Remotion, no animation libraries, no dependencies — one geometry generator,
+Pure vector animation on a canvas.
+
+https://github.com/user-attachments/assets/fd113db8-edb8-4b9d-9692-57eb57f56a31
+
+
+
+https://github.com/user-attachments/assets/be1f0940-fc2c-4452-bef7-b6b4bb9732d5
+
+
+No animation libraries, no dependencies — one geometry generator,
 one camera rig, one exporter, hand-written.
-
-Both are 1080 × 1920, 15.00 s, 60 fps, and loop **pixel-exactly**.
-
-| | |
-|---|---|
-| **`iris.html`**<br>*it blinks back* | An eye opens; you fall through the pupil into a corridor of screens, each arriving as a circle and becoming a screen as it reaches you. Every threshold turns the world inside out, and it accelerates. The last screen morphs into the pupil and the lids close around it. |
-| **`iris-swipe.html`** | The same eye, the same fall. Beyond it, a deck of tiles and a thumb throwing them upward, faster and faster — 26 throws from 0.45 s apart down to 0.18 s. Each tile carries a small picture of an eye. The last one is not thrown: it morphs into the pupil instead. |
-| **`index.html`** | The original test the system grew out of — a circle morphing to a rounded square. |
-
-*We keep building brighter screens, and every one of them is shaped like the eye
-that made it. You swipe past every image of the thing, and the thing is
-watching. The loop is the scroll.*
-
-## Posting
-
-Short, because the video is the pitch. The caption's job is to reframe what the
-viewer just did, not to describe what they just saw.
-
-**`iris.html`**
-
-> **it blinks back**
->
-> you stopped. it noticed.
->
-> `#motiondesign` `#creativecoding`
-
-Swap `#creativecoding` for `#loopanimation` to lean on the loop rather than the
-craft.
-
-## Run
-
-```bash
-node server.mjs
-```
-
-Then open `http://localhost:5173/iris.html` or `/iris-swipe.html`.
 
 Space toggles playback and the scrubber seeks. **Save video** renders the loop
 offline through WebCodecs and writes the MP4 by hand — every frame is drawn and
